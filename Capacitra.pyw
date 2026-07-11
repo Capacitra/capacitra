@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1880,6 +1880,9 @@ class CapacitraApp:
         self.result_queue = queue.Queue()
         self.scan_root = None
         self.scan_result = None
+        self._dup_result = None
+        self._downloads_hint = None
+        self._cheat_win = None
         self.current_node = None
         self._overview_payload = None
         self._tree_node_map = {}
@@ -1905,6 +1908,570 @@ class CapacitraApp:
         self._bind_shortcuts()
         root.after(80, self._poll_queue)
 
+
+    # ----- Keyboard cheatsheet overlay (v4.2) -----
+    def _show_cheatsheet(self):
+        """Full-screen ? overlay showing all keyboard shortcuts."""
+        if getattr(self, "_cheat_win", None) is not None:
+            try:
+                self._cheat_win.destroy()
+            except Exception:
+                pass
+            self._cheat_win = None
+            return
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        self._cheat_win = win
+        win.title("Keyboard shortcuts")
+        win.configure(bg=t["panel"])
+        win.transient(self.root)
+        # Center over the main window
+        self.root.update_idletasks()
+        w, h = 640, 520
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{max(0,x)}+{max(0,y)}")
+
+        outer = tk.Frame(win, bg=t["panel"])
+        outer.pack(fill="both", expand=True, padx=28, pady=24)
+        tk.Label(outer, text="Keyboard shortcuts", bg=t["panel"],
+                 fg=t["fg"], font=("Segoe UI Semibold", 18)).pack(anchor="w")
+        tk.Label(outer, text="Press ? or Esc to close",
+                 bg=t["panel"], fg=t["muted"],
+                 font=UI_FONT).pack(anchor="w", pady=(2, 18))
+
+        groups = [
+            ("Scan", [
+                ("Ctrl+O",       "Browse and scan folder"),
+                ("F5",           "Rescan current root"),
+                ("Esc",          "Cancel running scan"),
+            ]),
+            ("Search", [
+                ("Ctrl+F",       "Focus filter box"),
+                ("Ctrl+Shift+F", "Global find dialog"),
+            ]),
+            ("Export", [
+                ("Ctrl+E",       "Open export menu"),
+            ]),
+            ("Files", [
+                ("Del",          "Move selected to Recycle Bin"),
+                ("Enter",        "Open selected file"),
+            ]),
+            ("Help", [
+                ("?",            "Toggle this cheatsheet"),
+            ]),
+        ]
+
+        for title, rows in groups:
+            tk.Label(outer, text=title, bg=t["panel"], fg=t["accent"],
+                     font=("Segoe UI Semibold", 11)).pack(
+                         anchor="w", pady=(10, 4))
+            grid = tk.Frame(outer, bg=t["panel"])
+            grid.pack(fill="x", padx=6)
+            for i, (keys, desc) in enumerate(rows):
+                key_lbl = tk.Label(grid, text=keys, bg=t["panel_alt"],
+                                   fg=t["fg"], font=("Consolas", 10, "bold"),
+                                   padx=10, pady=4)
+                key_lbl.grid(row=i, column=0, sticky="w", pady=2)
+                tk.Label(grid, text=desc, bg=t["panel"], fg=t["fg_subtle"],
+                         font=UI_FONT).grid(row=i, column=1, sticky="w",
+                                            padx=(14, 0), pady=2)
+
+        def _close(_=None):
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._cheat_win = None
+
+        win.bind("<Escape>", _close)
+        win.bind("<Key-question>", _close)
+        win.protocol("WM_DELETE_WINDOW", _close)
+        win.focus_set()
+
+
+    # =========================================================
+    # v4.2 Sprint A: Empty folders / Suspicious exes / Downloads
+    # =========================================================
+    _SUSPICIOUS_EXTENSIONS = {
+        ".exe", ".dll", ".bat", ".ps1", ".vbs", ".scr", ".cmd", ".msi",
+        ".jar", ".hta", ".wsf",
+    }
+    _SUSPICIOUS_SAFE_PREFIXES = None  # populated lazily
+
+    def _safe_path_prefixes(self):
+        """Windows path prefixes that we treat as 'known-good' (i.e. not
+        surfaced by the suspicious executable finder)."""
+        if self._SUSPICIOUS_SAFE_PREFIXES is None:
+            prefixes = []
+            for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432",
+                        "windir", "SystemRoot"):
+                v = os.environ.get(env)
+                if v:
+                    prefixes.append(v.rstrip("\\").lower())
+            # Common Microsoft-owned data trees
+            for extra in (r"C:\ProgramData\Microsoft",
+                          r"C:\ProgramData\Package Cache",
+                          r"C:\Windows",
+                          r"C:\Program Files",
+                          r"C:\Program Files (x86)"):
+                prefixes.append(extra.lower())
+            self.__class__._SUSPICIOUS_SAFE_PREFIXES = list(set(prefixes))
+        return self._SUSPICIOUS_SAFE_PREFIXES
+
+    def _is_safe_path(self, p):
+        p = (p or "").lower()
+        for pref in self._safe_path_prefixes():
+            if p.startswith(pref):
+                return True
+        return False
+
+    # ----- Empty folder finder ---------------------------------------
+    def _find_empty_folders(self):
+        if not self.scan_result:
+            self._warn("Run a scan first",
+                       "Pick a folder or drive and click New Scan, "
+                       "then try again.")
+            return
+        empties = []
+        def _walk(node):
+            if not node.is_dir:
+                return
+            # A folder counts as empty when it has no children at all
+            # (recursively descending into subdirs that themselves are
+            # empty). We only surface the outermost empty folder so the
+            # user can Recycle just it, not every leaf below.
+            has_content = any(
+                (not c.is_dir) or (c.size or 0) > 0 or c.children
+                for c in node.children
+            )
+            if not has_content and node.parent is not None:
+                empties.append(node.path)
+                return
+            for c in node.children:
+                _walk(c)
+        try:
+            _walk(self.scan_result["root"])
+        except RecursionError:
+            self._error("Recursion limit",
+                        "Folder tree is too deep to walk fully.")
+            return
+
+        if not empties:
+            self._info("No empty folders",
+                       "Nothing to clean up. Every folder in the scan "
+                       "contains at least one non-empty child.")
+            return
+
+        # Show a simple dialog with a listbox and "Move to Recycle Bin"
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(f"Empty folders — {len(empties)} found")
+        win.configure(bg=t["panel"])
+        win.transient(self.root)
+        win.geometry("720x520")
+
+        tk.Label(win, text=f"Empty folders — {len(empties):,} found",
+                 bg=t["panel"], fg=t["fg"],
+                 font=("Segoe UI Semibold", 15)).pack(
+                     anchor="w", padx=24, pady=(20, 4))
+        tk.Label(win,
+                 text="Select rows to move to the Recycle Bin. "
+                      "Nothing is hard-deleted.",
+                 bg=t["panel"], fg=t["muted"],
+                 font=UI_FONT).pack(anchor="w", padx=24, pady=(0, 12))
+
+        list_frame = tk.Frame(win, bg=t["panel"])
+        list_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+        lb = tk.Listbox(list_frame, selectmode="extended",
+                        bg=t["panel_alt"], fg=t["fg"],
+                        selectbackground=t["accent"],
+                        selectforeground="#FFFFFF",
+                        font=UI_FONT, activestyle="none",
+                        highlightthickness=0, borderwidth=0)
+        vs = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=vs.set)
+        lb.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        for p in empties:
+            lb.insert("end", p)
+
+        btn_bar = tk.Frame(win, bg=t["panel"])
+        btn_bar.pack(fill="x", padx=24, pady=(0, 20))
+
+        def _select_all():
+            lb.selection_set(0, "end")
+
+        def _recycle_selected():
+            idxs = lb.curselection()
+            if not idxs:
+                if self._ask(
+                        "Recycle all?",
+                        f"No rows selected. Move all {len(empties)} "
+                        "empty folders to the Recycle Bin?"):
+                    idxs = tuple(range(lb.size()))
+                else:
+                    return
+            paths = [lb.get(i) for i in idxs]
+            if not self._ask(
+                    "Move to Recycle Bin",
+                    f"Move {len(paths)} folder(s) to the Recycle Bin?\n"
+                    "Nothing is hard-deleted."):
+                return
+            ok = 0
+            for p in paths:
+                try:
+                    if send_to_recycle_bin(p):
+                        ok += 1
+                except Exception:
+                    pass
+            self._info("Done",
+                       f"Moved {ok}/{len(paths)} to Recycle Bin.")
+            try:
+                self._refresh_after_recycle(paths)
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        tk.Button(btn_bar, text="Select all", command=_select_all,
+                  bg=t["panel_alt"], fg=t["fg"], relief="flat",
+                  padx=14, pady=6).pack(side="left")
+        tk.Button(btn_bar, text="Move selected to Recycle Bin",
+                  command=_recycle_selected,
+                  bg=t["accent"], fg="#FFFFFF", relief="flat",
+                  padx=16, pady=6, font=UI_FONT_BOLD).pack(side="right")
+        tk.Button(btn_bar, text="Close", command=win.destroy,
+                  bg=t["panel_alt"], fg=t["fg"], relief="flat",
+                  padx=14, pady=6).pack(side="right", padx=(0, 8))
+
+    # ----- Suspicious executable finder -------------------------------
+    def _show_suspicious_exes(self):
+        if not self.scan_result:
+            self._warn("Run a scan first",
+                       "Pick a folder or drive and click New Scan.")
+            return
+        hits = []
+        exts = self._SUSPICIOUS_EXTENSIONS
+
+        def _walk(node):
+            if node.is_dir:
+                for c in node.children:
+                    _walk(c)
+                return
+            p = node.path
+            if not p or p.startswith("("):
+                return
+            ext = os.path.splitext(p)[1].lower()
+            if ext not in exts:
+                return
+            if self._is_safe_path(p):
+                return
+            hits.append((node.mtime or 0, node.size or 0, p, ext))
+
+        try:
+            _walk(self.scan_result["root"])
+        except RecursionError:
+            self._error("Recursion limit",
+                        "Folder tree is too deep to walk fully.")
+            return
+
+        hits.sort(reverse=True)  # newest first
+
+        if not hits:
+            self._info(
+                "No suspicious executables",
+                "Every .exe / .dll / .bat / .ps1 / .vbs found is inside "
+                "Program Files, Windows or ProgramData. That's the "
+                "normal state on a clean system.")
+            return
+
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(f"Suspicious executables — {len(hits)} found")
+        win.configure(bg=t["panel"])
+        win.transient(self.root)
+        win.geometry("960x600")
+
+        tk.Label(win,
+                 text=f"Executables outside standard locations — "
+                      f"{len(hits):,} found",
+                 bg=t["panel"], fg=t["fg"],
+                 font=("Segoe UI Semibold", 15)).pack(
+                     anchor="w", padx=24, pady=(20, 4))
+        tk.Label(win,
+                 text="Sorted by modification time, newest first. "
+                      "A file appearing here is not necessarily malicious, "
+                      "but every one deserves a second look on unfamiliar "
+                      "systems.",
+                 bg=t["panel"], fg=t["muted"], font=UI_FONT,
+                 justify="left", wraplength=880).pack(
+                     anchor="w", padx=24, pady=(0, 12))
+
+        tree_frame = tk.Frame(win, bg=t["panel"])
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+        tv = ttk.Treeview(tree_frame,
+                          columns=("modified", "size", "type"),
+                          show="tree headings")
+        tv.heading("#0", text="Path")
+        tv.heading("modified", text="Modified")
+        tv.heading("size", text="Size")
+        tv.heading("type", text="Type")
+        tv.column("#0", width=560, anchor="w")
+        tv.column("modified", width=160, anchor="w")
+        tv.column("size", width=100, anchor="e")
+        tv.column("type", width=80, anchor="w")
+        vs = ttk.Scrollbar(tree_frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        for mt, sz, p, ext in hits[:5000]:  # cap for UI perf
+            when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(mt))
+                    if mt else "")
+            tv.insert("", "end", text=p,
+                      values=(when, human_size(sz), ext))
+
+        btn_bar = tk.Frame(win, bg=t["panel"])
+        btn_bar.pack(fill="x", padx=24, pady=(0, 20))
+
+        def _reveal():
+            sel = tv.selection()
+            if not sel:
+                return
+            p = tv.item(sel[0], "text")
+            try:
+                subprocess.Popen(["explorer", "/select,", p])
+            except Exception:
+                pass
+
+        def _copy():
+            sel = tv.selection()
+            if not sel:
+                return
+            p = tv.item(sel[0], "text")
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(p)
+            except Exception:
+                pass
+
+        tk.Button(btn_bar, text="Show in Explorer", command=_reveal,
+                  bg=t["panel_alt"], fg=t["fg"], relief="flat",
+                  padx=14, pady=6).pack(side="left")
+        tk.Button(btn_bar, text="Copy path", command=_copy,
+                  bg=t["panel_alt"], fg=t["fg"], relief="flat",
+                  padx=14, pady=6).pack(side="left", padx=(8, 0))
+        tk.Button(btn_bar, text="Close", command=win.destroy,
+                  bg=t["accent"], fg="#FFFFFF", relief="flat",
+                  padx=16, pady=6, font=UI_FONT_BOLD).pack(side="right")
+
+    # ----- Downloads folder aging (post-scan analysis) ---------------
+    _DL_AGE_DAYS = 30
+    _DL_AGE_MIN_BYTES = 100 * 1024 * 1024  # 100 MB threshold
+
+    def _analyze_downloads_aging(self):
+        """Look for a Downloads folder in the scan result and compute
+        aged (>30 days) bytes. Returns dict or None."""
+        if not self.scan_result:
+            return None
+        root = self.scan_result.get("root")
+        if root is None:
+            return None
+        target = None
+        # Prefer %USERPROFILE%\Downloads if it lives inside the scan
+        userprofile = os.environ.get("USERPROFILE", "")
+        expected = (os.path.join(userprofile, "Downloads").lower()
+            if userprofile else None)
+
+        def _find(node):
+            nonlocal target
+            if target is not None:
+                return
+            if node.is_dir:
+                p = (node.path or "").lower()
+                nm = (node.name or "").lower()
+                if expected and p == expected:
+                    target = node
+                    return
+                if nm == "downloads" and target is None:
+                    target = node  # tentative, keep looking for exact match
+                for c in node.children:
+                    _find(c)
+        try:
+            _find(root)
+        except RecursionError:
+            return None
+
+        if target is None:
+            return None
+
+        now = time.time()
+        thr = self._DL_AGE_DAYS * 86400
+        aged_bytes = 0
+        aged_count = 0
+
+        def _walk(n):
+            nonlocal aged_bytes, aged_count
+            if n.is_dir:
+                for c in n.children:
+                    _walk(c)
+                return
+            if n.mtime and (now - n.mtime) > thr:
+                aged_bytes += (n.size or 0)
+                aged_count += 1
+
+        try:
+            _walk(target)
+        except RecursionError:
+            return None
+
+        if aged_bytes < self._DL_AGE_MIN_BYTES:
+            return None
+        return {"path": target.path, "bytes": aged_bytes,
+                "count": aged_count, "days": self._DL_AGE_DAYS}
+
+    def _open_downloads_hint(self):
+        """Navigate the tree to the Downloads folder."""
+        info = getattr(self, "_downloads_hint", None)
+        if not info:
+            return
+        try:
+            self._select_panel("scan")
+        except Exception:
+            pass
+        try:
+            self.address_var.set(info["path"])
+        except Exception:
+            pass
+
+
+    # ----- Downloads folder aging dialog (v4.2) -----
+    def _show_downloads_hint(self):
+        info = getattr(self, "_downloads_hint", None)
+        if not info:
+            self._info(
+                "No aged Downloads content",
+                "Your Downloads folder either wasn't in the scan, "
+                "or has less than 100 MB of files older than "
+                f"{self._DL_AGE_DAYS} days.")
+            return
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Downloads folder aging")
+        win.configure(bg=t["panel"])
+        win.transient(self.root)
+        win.geometry("560x260")
+        tk.Label(win, text="Downloads folder aging",
+                 bg=t["panel"], fg=t["fg"],
+                 font=("Segoe UI Semibold", 15)).pack(
+                     anchor="w", padx=24, pady=(20, 4))
+        tk.Label(win,
+                 text=f"{info['path']}",
+                 bg=t["panel"], fg=t["muted"], font=UI_FONT,
+                 wraplength=500).pack(anchor="w", padx=24, pady=(0, 14))
+        tk.Label(win,
+                 text=human_size(info["bytes"]),
+                 bg=t["panel"], fg=t["accent"],
+                 font=("Segoe UI Semibold", 28)).pack(anchor="w", padx=24)
+        tk.Label(win,
+                 text=f"in {info['count']:,} files older than "
+                      f"{info['days']} days.",
+                 bg=t["panel"], fg=t["fg_subtle"], font=UI_FONT).pack(
+                     anchor="w", padx=24, pady=(0, 18))
+        btn = tk.Frame(win, bg=t["panel"])
+        btn.pack(fill="x", padx=24, pady=(0, 20))
+        def _open_folder():
+            try:
+                open_path(info["path"])
+            except Exception:
+                pass
+        tk.Button(btn, text="Open in Explorer", command=_open_folder,
+                  bg=t["accent"], fg="#FFFFFF", relief="flat",
+                  padx=16, pady=6, font=UI_FONT_BOLD).pack(side="left")
+        tk.Button(btn, text="Close", command=win.destroy,
+                  bg=t["panel_alt"], fg=t["fg"], relief="flat",
+                  padx=14, pady=6).pack(side="right")
+
+    # ----- Duplicate cluster viewer ----------------------------------
+    def _show_duplicate_clusters(self):
+        """Group duplicate SHA-1 groups by parent folder and list total
+        wasted bytes per folder. Actionable view."""
+        dups = getattr(self, "_dup_result", None) or {}
+        if not dups:
+            self._info(
+                "Run duplicate scan first",
+                "Open the Duplicates panel and click Find duplicates, "
+                "then come back here.")
+            return
+        by_folder = {}
+        for sha, group in dups.items():
+            if len(group) < 2:
+                continue
+            file_sz = group[0][1] if group else 0
+            wasted = file_sz * (len(group) - 1)
+            for path, sz in group:
+                fold = os.path.dirname(path)
+                if not fold:
+                    continue
+                b = by_folder.setdefault(fold, {"wasted": 0, "groups": 0})
+                # Attribute the waste to this folder proportional to how
+                # many copies of the group live here.
+                b["wasted"] += file_sz
+                b["groups"] += 1
+        # Sort by wasted desc
+        rows = sorted(by_folder.items(),
+                      key=lambda kv: kv[1]["wasted"], reverse=True)
+        if not rows:
+            self._info("No duplicate clusters",
+                       "No folder groups host duplicate content.")
+            return
+
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(f"Duplicate clusters — {len(rows)} folders with duplicates")
+        win.configure(bg=t["panel"])
+        win.transient(self.root)
+        win.geometry("880x560")
+
+        tk.Label(win, text="Duplicate clusters by folder",
+                 bg=t["panel"], fg=t["fg"],
+                 font=("Segoe UI Semibold", 15)).pack(
+                     anchor="w", padx=24, pady=(20, 4))
+        tk.Label(win,
+                 text="Which folders host the most wasted space? "
+                      "The top rows are usually Downloads / backup dirs.",
+                 bg=t["panel"], fg=t["muted"], font=UI_FONT).pack(
+                     anchor="w", padx=24, pady=(0, 12))
+
+        tree_frame = tk.Frame(win, bg=t["panel"])
+        tree_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
+        tv = ttk.Treeview(tree_frame,
+                          columns=("wasted", "groups"),
+                          show="tree headings")
+        tv.heading("#0", text="Folder")
+        tv.heading("wasted", text="Wasted bytes")
+        tv.heading("groups", text="Groups")
+        tv.column("#0", width=520, anchor="w")
+        tv.column("wasted", width=140, anchor="e")
+        tv.column("groups", width=90, anchor="e")
+        vs = ttk.Scrollbar(tree_frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=vs.set)
+        tv.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        for path, info in rows[:1000]:
+            tv.insert("", "end", text=path,
+                      values=(human_size(info["wasted"]),
+                              f"{info['groups']:,}"))
+
+        btn_bar = tk.Frame(win, bg=t["panel"])
+        btn_bar.pack(fill="x", padx=24, pady=(0, 20))
+        tk.Button(btn_bar, text="Close", command=win.destroy,
+                  bg=t["accent"], fg="#FFFFFF", relief="flat",
+                  padx=16, pady=6, font=UI_FONT_BOLD).pack(side="right")
+
     # ----- Keyboard shortcuts -----
     def _bind_shortcuts(self):
         b = self.root.bind_all
@@ -1922,6 +2489,8 @@ class CapacitraApp:
           lambda e: self._cancel_scan()
           if self.scan_thread and self.scan_thread.is_alive() else None)
         b("<Delete>",    lambda e: self._batch_recycle())
+        b("<Key-question>", lambda e: self._show_cheatsheet())
+        b("<Shift-slash>",  lambda e: self._show_cheatsheet())
 
     # ----- Batch recycle (called by Delete shortcut) -----
     def _batch_recycle(self):
@@ -2410,6 +2979,18 @@ class CapacitraApp:
         m.add_separator()
         m.add_command(label="Find duplicates",
                       command=self._find_duplicates)
+        m.add_command(label="Duplicate clusters by folder…",
+                      command=self._show_duplicate_clusters)
+        m.add_separator()
+        m.add_command(label="Find empty folders…",
+                      command=self._find_empty_folders)
+        m.add_command(label="Suspicious executables…",
+                      command=self._show_suspicious_exes)
+        m.add_command(label="Downloads folder aging…",
+                      command=self._show_downloads_hint)
+        m.add_separator()
+        m.add_command(label="Keyboard shortcuts  (?)",
+                      command=self._show_cheatsheet)
         m.add_separator()
         m.add_command(label="About Capacitra",
                       command=lambda: self._select_panel("about"))
@@ -3041,6 +3622,11 @@ class CapacitraApp:
                 kb = 256
                 self.dup_thr_var.set("256")
             ScanWorker.DUP_THRESHOLD = kb * 1024
+            # v4.2: expose duplicate results to Kebab menu
+            try:
+                self._dup_result = self._dup_last_groups
+            except Exception:
+                pass
             self.dup_status_var.set(
                 f"Threshold set to {kb} KB. Click Find Duplicates to "
                 f"re-scan for matching candidates.")
@@ -4831,6 +5417,20 @@ class CapacitraApp:
             root.children.sort(key=lambda n: n.size, reverse=True)
         self.scan_result = result
         self._overview_payload = None
+        try:
+            self._downloads_hint = self._analyze_downloads_aging()
+        except Exception:
+            self._downloads_hint = None
+        # Surface a subtle status hint about aged Downloads content
+        try:
+            if self._downloads_hint:
+                self.status_var.set(
+                    "Tip: Downloads folder has "
+                    f"{human_size(self._downloads_hint['bytes'])} "
+                    "in files >30 days old. Open Downloads folder "
+                    "aging in the More menu for details.")
+        except Exception:
+            pass
         # Update export panel state (enable/disable status line)
         try:
             self._refresh_export_status()
