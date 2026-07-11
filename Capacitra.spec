@@ -1,13 +1,41 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# PyInstaller build spec for Capacitra.
+#
+# NOTE: strip must be False on Windows. Enabling it corrupts python311.dll's
+# import table and causes 'Failed to load Python DLL / LoadLibrary: Invalid
+# access to memory location' on the target machine.
+#
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = []
-tmp_ret = collect_all('reportlab')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('openpyxl')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = [
+    'reportlab',
+    'reportlab.pdfgen',
+    'reportlab.lib.pagesizes',
+    'reportlab.lib.styles',
+    'reportlab.platypus',
+    'reportlab.lib',
+    'openpyxl',
+    'openpyxl.styles',
+    'openpyxl.utils',
+    'openpyxl.workbook',
+    'PIL',
+    'PIL.Image',
+    'PIL.ImageDraw',
+    'PIL.ImageTk',
+]
+
+# collect_all pulls package data, C extensions, and hidden imports
+for pkg in ('reportlab', 'openpyxl', 'PIL'):
+    try:
+        tmp_datas, tmp_binaries, tmp_hidden = collect_all(pkg)
+        datas += tmp_datas
+        binaries += tmp_binaries
+        hiddenimports += tmp_hidden
+    except Exception:
+        pass
 
 
 a = Analysis(
@@ -19,32 +47,5 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['pytest', 'setuptools', 'pip', 'wheel', 'unittest', 'pydoc', 'tkinter.test', 'test'],
-    noarchive=False,
-    optimize=0,
-)
-pyz = PYZ(a.pure)
-
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
-    name='Capacitra',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=True,
-    upx=False,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    version='version_info.txt',
-    icon=['capacitra.ico'],
-    manifest='Capacitra.manifest',
-)
+    excludes=[
+        'pytest', 'se
