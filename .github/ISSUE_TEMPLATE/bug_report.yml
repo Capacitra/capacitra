@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a defect in Capacitra
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in every field
+        you can — the more we know, the faster we fix.
+
+        For security issues, please email **info@capacitra.com** instead of
+        opening a public issue.
+
+  - type: input
+    id: version
+    attributes:
+      label: Capacitra version
+      description: See the About panel, or run `Capacitra.exe --version`.
+      placeholder: "4.1"
+    validations:
+      required: true
+
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Run `winver` and paste the version + build.
+      placeholder: "Windows 11 24H2 (26100.xxxx)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: How did you get Capacitra?
+      options:
+        - Downloaded Capacitra.exe from capacitra.com
+        - Built from source (git)
+        - GitHub Release artifact
+        - Other (please describe)
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: What did you do, in order?
+      placeholder: |
+        1. Open Capacitra
+        2. Pick drive D:
+        3. Click New Scan
+        4. Wait ~2 minutes
+        5. Crash
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, error dialog text, `Event Viewer` entries.

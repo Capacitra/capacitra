@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest an improvement
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing a large feature, please check the roadmap in the
+        Discussions tab. A good proposal describes the problem, not the
+        implementation.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: A concrete situation where Capacitra falls short today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like Capacitra to behave?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Does the proposal respect our constraints?
+      description: Please confirm.
+      options:
+        - label: No telemetry, analytics, or network calls
+          required: true
+        - label: No hard-deletion of user files
+          required: true
+        - label: No new bundled font/icon assets without a permissive license
+          required: true

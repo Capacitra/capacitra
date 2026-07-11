@@ -1,0 +1,37 @@
+# PyInstaller version-info resource for Windows.
+# This metadata makes the .exe look legitimate to SmartScreen and many
+# antivirus heuristics. Without it, single-file PyInstaller binaries are
+# routinely flagged as "unknown publisher / no version info" malware.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(4, 0, 0, 0),
+    prodvers=(4, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',
+          [
+            StringStruct(u'CompanyName',      u'Capacitra'),
+            StringStruct(u'FileDescription',  u'Capacitra - Storage capacity intelligence'),
+            StringStruct(u'FileVersion',      u'4.0.0.0'),
+            StringStruct(u'InternalName',     u'Capacitra'),
+            StringStruct(u'LegalCopyright',   u'© 2026 Capacitra. All rights reserved.'),
+            StringStruct(u'OriginalFilename', u'Capacitra.exe'),
+            StringStruct(u'ProductName',      u'Capacitra'),
+            StringStruct(u'ProductVersion',   u'4.0.0.0'),
+            StringStruct(u'Comments',         u'Free, on-premise disk space analyser for Windows. https://capacitra.com'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

@@ -1,0 +1,41 @@
+# Byte-compiled / packaged Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# PyInstaller build artefacts
+*.spec.bak
+warn-Capacitra.txt
+xref-Capacitra.html
+
+# Local dev
+.venv/
+venv/
+env/
+.python-version
+*.log
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Signing secrets (should be in GitHub Actions Secrets, never in the repo)
+*.pfx
+*.p12
+*.key
+*.pem
+cert-password.txt
+
+# Personal build outputs
+Capacitra.exe
