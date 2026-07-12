@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.3.1"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1144,12 +1144,14 @@ class TreemapChart(BaseChart):
                              text=self._trunc(node.name, max_chars),
                              fill="white",
                              font=("Segoe UI Semibold", 10))
-            self.create_text(cx, cy_icon + cr + 32,
+            self.create_text(cx, cy_icon + cr + 34,
                              text=human_size(node.size),
                              fill="white",
-                             font=("Segoe UI Semibold", 14))
-            if ih >= 170:
-                self.create_text(cx, cy_icon + cr + 52,
+                             font=("Segoe UI Semibold", 13))
+            # Only show percent when the tile is comfortably tall
+            # (was overlapping with size text on borderline tiles).
+            if ih >= 190:
+                self.create_text(cx, cy_icon + cr + 60,
                                  text=f"{pct:.1f}%",
                                  fill=self._lighten(color, 0.85),
                                  font=("Segoe UI", 9))
@@ -2702,11 +2704,21 @@ class CapacitraApp:
             self.tree.tag_configure("synth", foreground=t["muted"])
 
     def _toggle_theme(self):
-        # Remember where the user is so we can return there after rebuild.
+        # Show wait cursor before the (expensive) rebuild so the user
+        # gets immediate visual feedback that the app is working.
+        try:
+            self.root.configure(cursor="watch")
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        # Defer the actual work one tick so the cursor change actually
+        # renders before we block the UI thread with the rebuild.
+        self.root.after(20, self._do_toggle_theme)
+
+    def _do_toggle_theme(self):
         prev_panel = self._active_panel or "overview"
         self.theme_name = "dark" if self.theme_name == "light" else "light"
         self.theme = THEMES[self.theme_name]
-        # Full rebuild is the simplest way to repaint everything cleanly
         for child in self.root.winfo_children():
             child.destroy()
         self._nav_items.clear()
@@ -2717,9 +2729,12 @@ class CapacitraApp:
         self._apply_theme()
         self._select_panel(prev_panel if prev_panel in self._panels
                            else "overview")
-        # Restore data
         if self.scan_result:
             self._on_scan_done(self.scan_result, _restore=True)
+        try:
+            self.root.configure(cursor="")
+        except Exception:
+            pass
 
     # ----- top-level layout -----
     def _build_layout(self):
@@ -2777,19 +2792,23 @@ class CapacitraApp:
         self.sb_disk_card.pack(side="bottom", fill="x",
                                padx=14, pady=14, ipady=2)
         inner = tk.Frame(self.sb_disk_card, bg=t["sb_bg_active"])
-        inner.pack(fill="x", padx=12, pady=10)
+        inner.pack(fill="x", padx=10, pady=10)
         tk.Label(inner, text="🖴", bg=t["sb_bg_active"], fg=t["sb_fg_active"],
-                 font=("Segoe UI Emoji", 13)).pack(side="left", padx=(0, 8))
+                 font=("Segoe UI Emoji", 12)).pack(side="left", padx=(0, 6))
         col = tk.Frame(inner, bg=t["sb_bg_active"])
         col.pack(side="left", fill="x", expand=True)
         self.sb_disk_title = tk.Label(col, text="No drive scanned yet",
                                       bg=t["sb_bg_active"],
                                       fg=t["sb_fg_active"],
-                                      font=("Segoe UI", 9, "bold"))
+                                      font=("Segoe UI", 9, "bold"),
+                                      anchor="w", wraplength=170,
+                                      justify="left")
         self.sb_disk_title.pack(anchor="w")
         self.sb_disk_sub = tk.Label(col, text="—",
                                     bg=t["sb_bg_active"],
-                                    fg=t["sb_label"], font=("Segoe UI", 8))
+                                    fg=t["sb_label"], font=("Segoe UI", 8),
+                                    anchor="w", wraplength=170,
+                                    justify="left")
         self.sb_disk_sub.pack(anchor="w")
         self.sb_progress = tk.Canvas(self.sb_disk_card,
                                      height=6,
@@ -3277,12 +3296,12 @@ class CapacitraApp:
         # Side actions: certain nav items trigger a flow instead of just
         # showing a panel.
         if key == "scan":
-            # Navigate to Overview where the user can pick a drive or
-            # click Browse… — don't auto-open a dialog (annoying).
+            # v4.3.1: "Scan" now triggers Browse + New Scan flow directly.
             self._select_panel("overview")
-            self.status_var.set(
-                "Pick a drive on the address bar, click Browse… for a "
-                "custom folder, then hit New Scan.")
+            try:
+                self.root.after(80, self._browse_and_scan)
+            except Exception:
+                pass
             return
         # Export now has its own panel (no popup menu)
 
@@ -3410,16 +3429,16 @@ class CapacitraApp:
         self.tree.heading("accessed",  text="Last accessed",
                           command=lambda: self._sort_tree("accessed"))
         self.tree.heading("owner",     text="Owner")
-        self.tree.column("#0",        width=260, minwidth=180, anchor="w", stretch=True)
-        self.tree.column("size",      width=88,  minwidth=64,  anchor="e", stretch=False)
-        self.tree.column("allocated", width=96,  minwidth=76,  anchor="e", stretch=False)
-        self.tree.column("files",     width=76,  minwidth=52,  anchor="e", stretch=False)
-        self.tree.column("folders",   width=84,  minwidth=56,  anchor="e", stretch=False)
+        self.tree.column("#0",        width=280, minwidth=180, anchor="w", stretch=True)
+        self.tree.column("size",      width=92,  minwidth=68,  anchor="e", stretch=False)
+        self.tree.column("allocated", width=108, minwidth=88,  anchor="e", stretch=False)
+        self.tree.column("files",     width=80,  minwidth=58,  anchor="e", stretch=False)
+        self.tree.column("folders",   width=92,  minwidth=68,  anchor="e", stretch=False)
         self.tree.column("bar",       width=96,  minwidth=60,  anchor="w", stretch=False)
-        self.tree.column("percent",   width=64,  minwidth=42,  anchor="e", stretch=False)
-        self.tree.column("modified",  width=132, minwidth=96,  anchor="w", stretch=False)
-        self.tree.column("accessed",  width=132, minwidth=96,  anchor="w", stretch=False)
-        self.tree.column("owner",     width=220, minwidth=120, anchor="w", stretch=False)
+        self.tree.column("percent",   width=68,  minwidth=46,  anchor="e", stretch=False)
+        self.tree.column("modified",  width=140, minwidth=110, anchor="w", stretch=False)
+        self.tree.column("accessed",  width=140, minwidth=110, anchor="w", stretch=False)
+        self.tree.column("owner",     width=260, minwidth=140, anchor="w", stretch=False)
         # Owner column cache: maps path -> resolved owner string
         if not hasattr(self, "_owner_cache"):
             self._owner_cache = OrderedDict()
@@ -4289,7 +4308,7 @@ class CapacitraApp:
 
         # Center column inside the scrollable inner frame
         inner.grid_columnconfigure(0, weight=1)
-        inner.grid_columnconfigure(1, weight=0, minsize=820)
+        inner.grid_columnconfigure(1, weight=0, minsize=1080)
         inner.grid_columnconfigure(2, weight=1)
         shell = tk.Frame(inner, bg=t["bg"])
         shell.grid(row=0, column=1, sticky="nsew", pady=(0, 28))
@@ -4326,7 +4345,7 @@ class CapacitraApp:
                      ).pack(anchor="w", pady=(10, 6))
             for p in paras:
                 tk.Label(b_in, text=p, bg=t["panel"], fg=t["fg_subtle"],
-                         font=UI_FONT, wraplength=720, justify="left"
+                         font=UI_FONT, wraplength=980, justify="left"
                          ).pack(anchor="w", pady=(0, 6))
 
         section("What is Capacitra?", [
@@ -5539,9 +5558,10 @@ class CapacitraApp:
             self.status_var.set(
                 f"Ready  ·  {files:,} files  ·  {human_size(total)}")
         # Sidebar disk card
-        nice_label = self.scan_root
-        if len(nice_label) <= 4:
-            nice_label = f"Local Disk ({self.scan_root.rstrip(chr(92))})"
+        # Sidebar card is narrow — use short label (drive letter only)
+        # so text doesn't get clipped.
+        _dr = self.scan_root.rstrip(chr(92)).rstrip("/")
+        nice_label = _dr if _dr else "Local Disk"
         self._update_sb_disk(disk["used"], disk["total"], nice_label)
         # Folder tree card stats
         self.tree_stat_lbl.configure(
