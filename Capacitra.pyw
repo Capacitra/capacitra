@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.2.1"
+APP_VERSION = "4.2.2"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1155,19 +1155,22 @@ class TreemapChart(BaseChart):
                                  font=("Segoe UI", 9))
             text_id = rect
         elif iw >= 80 and ih >= 38:
-            # SMALL tile — truncated name (no wrap) + size
-            tx = x1 + 10
-            ty = y1 + 8
-            max_chars = max(5, int((iw - 14) / 6.8))
+            # SMALL tile — truncated name (no wrap) + size (if room)
+            tx = x1 + 8
+            ty = y1 + 6
+            # Aggressive char cap so size text never runs off the edge
+            max_chars = max(3, int((iw - 12) / 7.4))
             self.create_text(tx, ty, anchor="nw",
                              text=self._trunc(node.name, max_chars),
                              fill="white",
                              font=("Segoe UI Semibold", 9))
-            if ih >= 42:
-                self.create_text(tx, ty + 16, anchor="nw",
+            # Only draw size when tile is wide AND tall enough to fit it
+            # (14pt font ~ 65 px wide for "1024 MB" or "5.89 GB")
+            if iw >= 110 and ih >= 44:
+                self.create_text(tx, ty + 15, anchor="nw",
                                  text=human_size(node.size),
                                  fill="white",
-                                 font=("Segoe UI Semibold", 12))
+                                 font=("Segoe UI Semibold", 11))
             text_id = rect
         # else: very small — no text, just the coloured tile
 
@@ -2947,11 +2950,22 @@ class CapacitraApp:
             self.sidebar.configure(width=240)
             for it in self._nav_items.values():
                 it.text_lbl.pack(side="left", pady=10)
+            # Show the disk card again
+            try:
+                self.sb_disk_card.pack(side="bottom", fill="x",
+                                       padx=14, pady=14, ipady=2)
+            except Exception:
+                pass
             self._sidebar_collapsed = False
         else:
             self.sidebar.configure(width=64)
             for it in self._nav_items.values():
                 it.text_lbl.pack_forget()
+            # Hide the disk card entirely — text would truncate ugly
+            try:
+                self.sb_disk_card.pack_forget()
+            except Exception:
+                pass
             self._sidebar_collapsed = True
 
     def _show_kebab_menu(self):
@@ -3328,16 +3342,16 @@ class CapacitraApp:
         self.tree.heading("accessed",  text="Last accessed",
                           command=lambda: self._sort_tree("accessed"))
         self.tree.heading("owner",     text="Owner")
-        self.tree.column("#0",        width=240, anchor="w", stretch=True)
-        self.tree.column("size",      width=80,  anchor="e", stretch=False)
-        self.tree.column("allocated", width=80,  anchor="e", stretch=False)
-        self.tree.column("files",     width=60,  anchor="e", stretch=False)
-        self.tree.column("folders",   width=60,  anchor="e", stretch=False)
-        self.tree.column("bar",       width=80,  anchor="w", stretch=False)
-        self.tree.column("percent",   width=52,  anchor="e", stretch=False)
-        self.tree.column("modified",  width=108, anchor="w", stretch=False)
-        self.tree.column("accessed",  width=108, anchor="w", stretch=False)
-        self.tree.column("owner",     width=200, anchor="w", stretch=False)
+        self.tree.column("#0",        width=260, minwidth=180, anchor="w", stretch=True)
+        self.tree.column("size",      width=88,  minwidth=64,  anchor="e", stretch=False)
+        self.tree.column("allocated", width=96,  minwidth=76,  anchor="e", stretch=False)
+        self.tree.column("files",     width=76,  minwidth=52,  anchor="e", stretch=False)
+        self.tree.column("folders",   width=84,  minwidth=56,  anchor="e", stretch=False)
+        self.tree.column("bar",       width=96,  minwidth=60,  anchor="w", stretch=False)
+        self.tree.column("percent",   width=64,  minwidth=42,  anchor="e", stretch=False)
+        self.tree.column("modified",  width=132, minwidth=96,  anchor="w", stretch=False)
+        self.tree.column("accessed",  width=132, minwidth=96,  anchor="w", stretch=False)
+        self.tree.column("owner",     width=220, minwidth=120, anchor="w", stretch=False)
         # Owner column cache: maps path -> resolved owner string
         if not hasattr(self, "_owner_cache"):
             self._owner_cache = OrderedDict()
