@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.3.1"
+APP_VERSION = "4.3.2"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1108,12 +1108,13 @@ class TreemapChart(BaseChart):
                              text=self._trunc(node.name, max_chars),
                              fill="white",
                              font=("Segoe UI Semibold", 12))
-            self.create_text(tx, ty + 22, anchor="nw",
+            self.create_text(tx, ty + 24, anchor="nw",
                              text=human_size(node.size),
                              fill="white",
-                             font=("Segoe UI Semibold", 18))
-            if ih >= 130:
-                self.create_text(tx, ty + 52, anchor="nw",
+                             font=("Segoe UI Semibold", 17))
+            # Percent only when tile is comfortably tall
+            if ih >= 150:
+                self.create_text(tx, ty + 58, anchor="nw",
                                  text=f"{pct:.1f}%",
                                  fill=self._lighten(color, 0.85),
                                  font=("Segoe UI", 10))
@@ -1144,14 +1145,14 @@ class TreemapChart(BaseChart):
                              text=self._trunc(node.name, max_chars),
                              fill="white",
                              font=("Segoe UI Semibold", 10))
-            self.create_text(cx, cy_icon + cr + 34,
+            self.create_text(cx, cy_icon + cr + 36,
                              text=human_size(node.size),
                              fill="white",
-                             font=("Segoe UI Semibold", 13))
-            # Only show percent when the tile is comfortably tall
-            # (was overlapping with size text on borderline tiles).
-            if ih >= 190:
-                self.create_text(cx, cy_icon + cr + 60,
+                             font=("Segoe UI Semibold", 12))
+            # Percent only when tile is very tall — else it visually
+            # collides with the size text above.
+            if ih >= 210:
+                self.create_text(cx, cy_icon + cr + 72,
                                  text=f"{pct:.1f}%",
                                  fill=self._lighten(color, 0.85),
                                  font=("Segoe UI", 9))
@@ -1168,11 +1169,11 @@ class TreemapChart(BaseChart):
                              font=("Segoe UI Semibold", 9))
             # Only draw size when tile is wide AND tall enough to fit it
             # (14pt font ~ 65 px wide for "1024 MB" or "5.89 GB")
-            if iw >= 110 and ih >= 44:
-                self.create_text(tx, ty + 15, anchor="nw",
+            if iw >= 120 and ih >= 46:
+                self.create_text(tx, ty + 16, anchor="nw",
                                  text=human_size(node.size),
                                  fill="white",
-                                 font=("Segoe UI Semibold", 11))
+                                 font=("Segoe UI Semibold", 10))
             text_id = rect
         # else: very small — no text, just the coloured tile
 
@@ -1831,7 +1832,6 @@ class GhostIconButton(tk.Label):
 class CapacitraApp:
     NAV_ITEMS = [
         ("overview",   "🏠", "Overview",    False),
-        ("scan",       "🔍", "Scan",        False),
         ("treemap",    "🗺", "Treemap",     False),
         ("charts",     "📊", "Charts",      True),
         ("duplicates", "⎘",  "Duplicates",  False),
@@ -2642,10 +2642,10 @@ class CapacitraApp:
         s = self.style
         s.configure("Treeview", background=t["panel"],
                     fieldbackground=t["panel"], foreground=t["fg"],
-                    rowheight=26, font=UI_FONT, borderwidth=0)
+                    rowheight=30, font=UI_FONT, borderwidth=0)
         s.configure("Treeview.Heading", background=t["panel_alt"],
                     foreground=t["muted"], font=("Segoe UI", 9, "bold"),
-                    relief="flat", padding=8, borderwidth=0)
+                    relief="flat", padding=(10, 6), borderwidth=0)
         s.map("Treeview",
               background=[("selected", t["select"])],
               foreground=[("selected", t["fg"])])
@@ -2704,37 +2704,123 @@ class CapacitraApp:
             self.tree.tag_configure("synth", foreground=t["muted"])
 
     def _toggle_theme(self):
-        # Show wait cursor before the (expensive) rebuild so the user
-        # gets immediate visual feedback that the app is working.
+        """Instant, crash-safe theme toggle.
+
+        Does NOT destroy or rebuild the widget tree. Instead, walks every
+        widget recursively and remaps its colour attributes from the old
+        theme to the new theme. Chart canvases are then asked to redraw.
+
+        This replaces the older destroy+rebuild approach that could take
+        many seconds and occasionally crash on large scan results
+        (>300k tree items).
+        """
         try:
             self.root.configure(cursor="watch")
             self.root.update_idletasks()
         except Exception:
             pass
-        # Defer the actual work one tick so the cursor change actually
-        # renders before we block the UI thread with the rebuild.
-        self.root.after(20, self._do_toggle_theme)
-
-    def _do_toggle_theme(self):
-        prev_panel = self._active_panel or "overview"
-        self.theme_name = "dark" if self.theme_name == "light" else "light"
-        self.theme = THEMES[self.theme_name]
-        for child in self.root.winfo_children():
-            child.destroy()
-        self._nav_items.clear()
-        self._panels.clear()
-        self._active_panel = None
-        self._build_layout()
-        self._populate_drives()
-        self._apply_theme()
-        self._select_panel(prev_panel if prev_panel in self._panels
-                           else "overview")
-        if self.scan_result:
-            self._on_scan_done(self.scan_result, _restore=True)
         try:
-            self.root.configure(cursor="")
-        except Exception:
-            pass
+            old_theme = dict(self.theme)
+            self.theme_name = "dark" if self.theme_name == "light" else "light"
+            self.theme = THEMES[self.theme_name]
+
+            # Build old-colour -> new-colour mapping so any widget currently
+            # painted in an old-theme colour will get its new-theme
+            # equivalent.
+            colour_map = {}
+            for k, old_c in old_theme.items():
+                new_c = self.theme.get(k)
+                if old_c and new_c and old_c != new_c:
+                    colour_map[old_c] = new_c
+
+            # ttk styles (Treeview, Scrollbar, Progressbar) get updated
+            # here — this covers dozens of widgets in a single call.
+            try:
+                self._apply_theme()
+            except Exception:
+                pass
+
+            # Walk every tk widget and remap colour attributes
+            try:
+                self._retint_widget(self.root, colour_map)
+            except Exception:
+                pass
+
+            # Also walk any open Toplevel dialogs
+            try:
+                for w in self.root.winfo_children():
+                    if isinstance(w, tk.Toplevel):
+                        self._retint_widget(w, colour_map)
+            except Exception:
+                pass
+
+            # Redraw known chart canvases so their painted items match
+            for attr in ("hero_canvas", "bar_chart", "pie",
+                         "sb_progress", "top_folders_canvas"):
+                w = getattr(self, attr, None)
+                if w is None:
+                    continue
+                try:
+                    if hasattr(w, "cget"):
+                        cur = w.cget("bg")
+                        if cur in colour_map:
+                            w.configure(bg=colour_map[cur])
+                    if hasattr(w, "redraw"):
+                        w.redraw()
+                except Exception:
+                    pass
+
+            # Refresh the treemap if it holds data
+            try:
+                if hasattr(self, "treemap") and hasattr(self.treemap, "redraw"):
+                    self.treemap.redraw()
+            except Exception:
+                pass
+
+            # Update the moon/sun button icon
+            try:
+                if hasattr(self, "theme_btn"):
+                    self.theme_btn.configure(
+                        text="🌙" if self.theme_name == "light" else "☀"
+                    )
+            except Exception:
+                pass
+
+            # Force a final layout pass
+            try:
+                self.root.configure(bg=self.theme["bg"])
+                self.root.update_idletasks()
+            except Exception:
+                pass
+        finally:
+            try:
+                self.root.configure(cursor="")
+            except Exception:
+                pass
+
+    def _retint_widget(self, w, colour_map):
+        """Recursively walk widgets, remapping colour attributes.
+
+        Handles bg, fg, highlightbackground, highlightcolor,
+        selectbackground, selectforeground, insertbackground,
+        activebackground, activeforeground, disabledforeground,
+        readonlybackground. Silently skips widgets that don't support
+        a given attribute.
+        """
+        attrs = ("bg", "fg", "highlightbackground", "highlightcolor",
+                 "selectbackground", "selectforeground",
+                 "insertbackground", "activebackground",
+                 "activeforeground", "disabledforeground",
+                 "readonlybackground", "troughcolor")
+        for attr in attrs:
+            try:
+                cur = w.cget(attr)
+                if cur in colour_map:
+                    w.configure(**{attr: colour_map[cur]})
+            except Exception:
+                pass
+        for c in w.winfo_children():
+            self._retint_widget(c, colour_map)
 
     # ----- top-level layout -----
     def _build_layout(self):
@@ -3252,8 +3338,7 @@ class CapacitraApp:
         self._build_panel_history(stack)
         self._build_panel_export(stack)
         self._build_panel_about(stack)
-        # "Scan" navigates to overview (same data)
-        self._panels["scan"] = self._panels["overview"]
+
 
     def _select_panel(self, key):
         # Hide current
@@ -3279,7 +3364,6 @@ class CapacitraApp:
         # Update header subtitle/title
         title_map = {
             "overview":   ("Overview", "Get a quick overview of your disk usage"),
-            "scan":       ("Scan", "Pick a folder or drive and start a scan"),
             "treemap":    ("Treemap", "Hierarchical view of disk usage"),
             "charts":     ("Charts", "Pie and bar views of the current folder"),
             "duplicates": ("Duplicates", "Find identical files wasting space"),
@@ -3295,14 +3379,7 @@ class CapacitraApp:
         self.header_sub_lbl.configure(text=sub)
         # Side actions: certain nav items trigger a flow instead of just
         # showing a panel.
-        if key == "scan":
-            # v4.3.1: "Scan" now triggers Browse + New Scan flow directly.
-            self._select_panel("overview")
-            try:
-                self.root.after(80, self._browse_and_scan)
-            except Exception:
-                pass
-            return
+
         # Export now has its own panel (no popup menu)
 
     # ----- Status bar -----
@@ -3359,9 +3436,9 @@ class CapacitraApp:
                              highlightbackground=t["border"])
         tree_wrap.pack(fill="both", expand=True)
         head = tk.Frame(tree_wrap, bg=t["panel"])
-        head.pack(fill="x", padx=18, pady=(14, 8))
+        head.pack(fill="x", padx=20, pady=(16, 10))
         tk.Label(head, text="Folder Tree", bg=t["panel"], fg=t["fg"],
-                 font=("Segoe UI Semibold", 12)).pack(side="left")
+                 font=("Segoe UI Semibold", 13)).pack(side="left")
         # Tree header action icons (right side)
         icons_box = tk.Frame(head, bg=t["panel"])
         icons_box.pack(side="right")
@@ -3415,7 +3492,7 @@ class CapacitraApp:
                           command=lambda: self._sort_tree("#0"))
         self.tree.heading("size",      text="Size",
                           command=lambda: self._sort_tree("size"))
-        self.tree.heading("allocated", text="Allocated",
+        self.tree.heading("allocated", text="Alloc",
                           command=lambda: self._sort_tree("allocated"))
         self.tree.heading("files",     text="Files",
                           command=lambda: self._sort_tree("files"))
@@ -3424,21 +3501,21 @@ class CapacitraApp:
         self.tree.heading("bar",       text="")
         self.tree.heading("percent",   text="%",
                           command=lambda: self._sort_tree("percent"))
-        self.tree.heading("modified",  text="Last modified",
+        self.tree.heading("modified",  text="Modified",
                           command=lambda: self._sort_tree("modified"))
-        self.tree.heading("accessed",  text="Last accessed",
+        self.tree.heading("accessed",  text="Accessed",
                           command=lambda: self._sort_tree("accessed"))
         self.tree.heading("owner",     text="Owner")
-        self.tree.column("#0",        width=280, minwidth=180, anchor="w", stretch=True)
-        self.tree.column("size",      width=92,  minwidth=68,  anchor="e", stretch=False)
-        self.tree.column("allocated", width=108, minwidth=88,  anchor="e", stretch=False)
-        self.tree.column("files",     width=80,  minwidth=58,  anchor="e", stretch=False)
-        self.tree.column("folders",   width=92,  minwidth=68,  anchor="e", stretch=False)
-        self.tree.column("bar",       width=96,  minwidth=60,  anchor="w", stretch=False)
-        self.tree.column("percent",   width=68,  minwidth=46,  anchor="e", stretch=False)
-        self.tree.column("modified",  width=140, minwidth=110, anchor="w", stretch=False)
-        self.tree.column("accessed",  width=140, minwidth=110, anchor="w", stretch=False)
-        self.tree.column("owner",     width=260, minwidth=140, anchor="w", stretch=False)
+        self.tree.column("#0",        width=300, minwidth=200, anchor="w", stretch=True)
+        self.tree.column("size",      width=96,  minwidth=76,  anchor="e", stretch=False)
+        self.tree.column("allocated", width=90,  minwidth=72,  anchor="e", stretch=False)
+        self.tree.column("files",     width=92,  minwidth=72,  anchor="e", stretch=False)
+        self.tree.column("folders",   width=96,  minwidth=76,  anchor="e", stretch=False)
+        self.tree.column("bar",       width=100, minwidth=64,  anchor="w", stretch=False)
+        self.tree.column("percent",   width=72,  minwidth=52,  anchor="e", stretch=False)
+        self.tree.column("modified",  width=124, minwidth=100, anchor="w", stretch=False)
+        self.tree.column("accessed",  width=124, minwidth=100, anchor="w", stretch=False)
+        self.tree.column("owner",     width=280, minwidth=160, anchor="w", stretch=False)
         # Owner column cache: maps path -> resolved owner string
         if not hasattr(self, "_owner_cache"):
             self._owner_cache = OrderedDict()
