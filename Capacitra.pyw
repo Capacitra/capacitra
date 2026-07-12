@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.2"
+APP_VERSION = "4.2.1"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1267,18 +1267,18 @@ class PieChart(BaseChart):
             self.create_oval(lx, yy + 4, lx + 12, yy + 16,
                              fill=base_color, outline="")
             # name
-            short = label if len(label) <= 22 else label[:19] + "…"
+            short = label if len(label) <= 16 else label[:13] + "…"
             self.create_text(lx + 20, yy + 10, anchor="w",
                              text=short, font=UI_FONT,
                              fill=self.theme["chart_text"])
-            # size
-            self.create_text(lx + 220, yy + 10, anchor="w",
+            # tinted % chip at fixed right offset
+            chip_x1 = lx + 290
+            chip_x2 = chip_x1 + 56
+            # size right-anchored, with guaranteed 10px gap before chip
+            self.create_text(chip_x1 - 10, yy + 10, anchor="e",
                              text=human_size(value),
                              font=UI_FONT_BOLD,
                              fill=self.theme["chart_text"])
-            # tinted % chip
-            chip_x1 = lx + 290
-            chip_x2 = chip_x1 + 56
             self.create_polygon(
                 self._rrpts(chip_x1, yy + 2, chip_x2, yy + 18, 9),
                 smooth=True, fill=tint, outline="")
@@ -4280,7 +4280,7 @@ class CapacitraApp:
             "Capacitra is purpose-built for Windows 10 and 11, with a "
             "lean installer footprint and a single-executable distribution.",
             "Network shares, removable drives and mounted images are "
-            "all supported. macOS and Linux builds are on the roadmap.",
+            "all fully supported inside the Windows shell.",
         ])
         section("Capabilities at a glance", [
             "Treemap, bar, pie and folder-tree visualizations · "
