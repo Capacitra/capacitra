@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.2.2"
+APP_VERSION = "4.3.0"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -1934,6 +1934,8 @@ class CapacitraApp:
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
         win.geometry(f"{w}x{h}+{max(0,x)}+{max(0,y)}")
+        win.minsize(520, 440)
+        win.resizable(True, True)
 
         outer = tk.Frame(win, bg=t["panel"])
         outer.pack(fill="both", expand=True, padx=28, pady=24)
@@ -2072,6 +2074,7 @@ class CapacitraApp:
         win.title(f"Empty folders — {len(empties)} found")
         win.configure(bg=t["panel"])
         win.transient(self.root)
+        win.minsize(560, 420)
         win.geometry("720x520")
 
         tk.Label(win, text=f"Empty folders — {len(empties):,} found",
@@ -2082,7 +2085,8 @@ class CapacitraApp:
                  text="Select rows to move to the Recycle Bin. "
                       "Nothing is hard-deleted.",
                  bg=t["panel"], fg=t["muted"],
-                 font=UI_FONT).pack(anchor="w", padx=24, pady=(0, 12))
+                 font=UI_FONT, wraplength=640, justify="left").pack(
+                     anchor="w", padx=24, pady=(0, 12))
 
         list_frame = tk.Frame(win, bg=t["panel"])
         list_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
@@ -2196,6 +2200,7 @@ class CapacitraApp:
         win.title(f"Suspicious executables — {len(hits)} found")
         win.configure(bg=t["panel"])
         win.transient(self.root)
+        win.minsize(720, 480)
         win.geometry("960x600")
 
         tk.Label(win,
@@ -2336,22 +2341,7 @@ class CapacitraApp:
         return {"path": target.path, "bytes": aged_bytes,
                 "count": aged_count, "days": self._DL_AGE_DAYS}
 
-    def _open_downloads_hint(self):
-        """Navigate the tree to the Downloads folder."""
-        info = getattr(self, "_downloads_hint", None)
-        if not info:
-            return
-        try:
-            self._select_panel("scan")
-        except Exception:
-            pass
-        try:
-            self.address_var.set(info["path"])
-        except Exception:
-            pass
 
-
-    # ----- Downloads folder aging dialog (v4.2) -----
     def _show_downloads_hint(self):
         info = getattr(self, "_downloads_hint", None)
         if not info:
@@ -2366,7 +2356,8 @@ class CapacitraApp:
         win.title("Downloads folder aging")
         win.configure(bg=t["panel"])
         win.transient(self.root)
-        win.geometry("560x260")
+        win.minsize(560, 320)
+        win.geometry("640x360")
         tk.Label(win, text="Downloads folder aging",
                  bg=t["panel"], fg=t["fg"],
                  font=("Segoe UI Semibold", 15)).pack(
@@ -2402,7 +2393,7 @@ class CapacitraApp:
     def _show_duplicate_clusters(self):
         """Group duplicate SHA-1 groups by parent folder and list total
         wasted bytes per folder. Actionable view."""
-        dups = getattr(self, "_dup_result", None) or {}
+        dups = getattr(self, "_dup_result", None) or []
         if not dups:
             self._info(
                 "Run duplicate scan first",
@@ -2410,13 +2401,16 @@ class CapacitraApp:
                 "then come back here.")
             return
         by_folder = {}
-        for sha, group in dups.items():
-            if len(group) < 2:
+        # Each entry from _on_dup_done is (size, hash, paths)
+        for entry in dups:
+            try:
+                file_sz, _sha, paths = entry[0], entry[1], entry[2]
+            except (IndexError, TypeError):
                 continue
-            file_sz = group[0][1] if group else 0
-            wasted = file_sz * (len(group) - 1)
-            for path, sz in group:
-                fold = os.path.dirname(path)
+            if not paths or len(paths) < 2:
+                continue
+            for p in paths:
+                fold = os.path.dirname(p)
                 if not fold:
                     continue
                 b = by_folder.setdefault(fold, {"wasted": 0, "groups": 0})
@@ -2437,6 +2431,7 @@ class CapacitraApp:
         win.title(f"Duplicate clusters — {len(rows)} folders with duplicates")
         win.configure(bg=t["panel"])
         win.transient(self.root)
+        win.minsize(720, 480)
         win.geometry("880x560")
 
         tk.Label(win, text="Duplicate clusters by folder",
@@ -2446,7 +2441,8 @@ class CapacitraApp:
         tk.Label(win,
                  text="Which folders host the most wasted space? "
                       "The top rows are usually Downloads / backup dirs.",
-                 bg=t["panel"], fg=t["muted"], font=UI_FONT).pack(
+                 bg=t["panel"], fg=t["muted"], font=UI_FONT,
+                 wraplength=760, justify="left").pack(
                      anchor="w", padx=24, pady=(0, 12))
 
         tree_frame = tk.Frame(win, bg=t["panel"])
@@ -2751,12 +2747,14 @@ class CapacitraApp:
         # Logo box
         logo_row = tk.Frame(self.sidebar, bg=t["sb_bg"])
         logo_row.pack(fill="x", padx=16, pady=(20, 16))
+        self._sb_logo_row = logo_row  # exposed for toggle
         canvas = tk.Canvas(logo_row, width=44, height=44, bg=t["sb_bg"],
                            highlightthickness=0)
         canvas.pack(side="left")
         self._draw_capacitra_mark(canvas, 22, 22, 20)
         text_box = tk.Frame(logo_row, bg=t["sb_bg"])
         text_box.pack(side="left", padx=10)
+        self._sb_logo_text_box = text_box  # exposed for toggle
         tk.Label(text_box, text=APP_NAME, bg=t["sb_bg"], fg="white",
                  font=("Segoe UI Semibold", 13)).pack(anchor="w")
         tk.Label(text_box, text=APP_TAGLINE, bg=t["sb_bg"],
@@ -2848,6 +2846,7 @@ class CapacitraApp:
         t = self.theme
         switch_row = tk.Frame(self.sidebar, bg=t["sb_bg"])
         switch_row.pack(side="bottom", fill="x", padx=24, pady=(0, 18))
+        self._sb_theme_row = switch_row  # exposed for toggle
         sun_lbl = tk.Label(switch_row, text="☀", bg=t["sb_bg"],
                            fg=t["sb_fg_active"] if self.theme_name == "light"
                               else t["sb_label"],
@@ -2947,26 +2946,95 @@ class CapacitraApp:
         if not hasattr(self, "_sidebar_collapsed"):
             self._sidebar_collapsed = False
         if self._sidebar_collapsed:
+            # Expand back
             self.sidebar.configure(width=240)
             for it in self._nav_items.values():
-                it.text_lbl.pack(side="left", pady=10)
-            # Show the disk card again
+                try:
+                    it.text_lbl.pack(side="left", pady=10)
+                except Exception:
+                    pass
+                # Restore chevron if this item has a submenu
+                if getattr(it, "chev", None) is not None:
+                    try:
+                        it.chev.pack(side="right", padx=(0, 14))
+                    except Exception:
+                        pass
+                # Icon back to left-aligned
+                try:
+                    it.icon_lbl.pack_forget()
+                    it.icon_lbl.pack(side="left", padx=(12, 12))
+                except Exception:
+                    pass
+            # Restore logo text
+            try:
+                self._sb_logo_text_box.pack(side="left", padx=10)
+            except Exception:
+                pass
+            # Restore theme switch row
+            try:
+                self._sb_theme_row.pack(side="bottom", fill="x",
+                                        padx=24, pady=(0, 18))
+            except Exception:
+                pass
+            # Restore disk card
             try:
                 self.sb_disk_card.pack(side="bottom", fill="x",
                                        padx=14, pady=14, ipady=2)
             except Exception:
                 pass
+            # Restore logo row with original 16px padding
+            try:
+                self._sb_logo_row.pack_forget()
+                self._sb_logo_row.pack(fill="x", padx=16, pady=(20, 16))
+            except Exception:
+                pass
             self._sidebar_collapsed = False
         else:
+            # Collapse to 64px icon-rail
             self.sidebar.configure(width=64)
             for it in self._nav_items.values():
-                it.text_lbl.pack_forget()
-            # Hide the disk card entirely — text would truncate ugly
+                try:
+                    it.text_lbl.pack_forget()
+                except Exception:
+                    pass
+                if getattr(it, "chev", None) is not None:
+                    try:
+                        it.chev.pack_forget()
+                    except Exception:
+                        pass
+                # Center the icon in the collapsed 64px rail
+                try:
+                    it.icon_lbl.pack_forget()
+                    it.icon_lbl.pack(pady=10)
+                except Exception:
+                    pass
+            # Hide logo text — only the mark remains visible
+            try:
+                self._sb_logo_text_box.pack_forget()
+            except Exception:
+                pass
+            # Hide theme switch row (pill is too wide for 64px)
+            try:
+                self._sb_theme_row.pack_forget()
+            except Exception:
+                pass
+            # Hide disk card entirely
             try:
                 self.sb_disk_card.pack_forget()
             except Exception:
                 pass
+            # Recenter the 44px logo inside 64px rail (padx 10 vs 16)
+            try:
+                self._sb_logo_row.pack_forget()
+                self._sb_logo_row.pack(fill="x", padx=10, pady=(20, 16))
+            except Exception:
+                pass
             self._sidebar_collapsed = True
+        # Force immediate layout redraw
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
 
     def _show_kebab_menu(self):
         m = tk.Menu(self.root, tearoff=0)
@@ -3636,11 +3704,7 @@ class CapacitraApp:
                 kb = 256
                 self.dup_thr_var.set("256")
             ScanWorker.DUP_THRESHOLD = kb * 1024
-            # v4.2: expose duplicate results to Kebab menu
-            try:
-                self._dup_result = self._dup_last_groups
-            except Exception:
-                pass
+            # (v4.3: results now populated by _on_dup_done directly)
             self.dup_status_var.set(
                 f"Threshold set to {kb} KB. Click Find Duplicates to "
                 f"re-scan for matching candidates.")
@@ -4018,7 +4082,7 @@ class CapacitraApp:
         cont = tk.Frame(wrap, bg=t["panel"])
         cont.pack(fill="both", expand=True, padx=12, pady=(0, 16))
         cols = ("when", "scanned", "files", "folders", "denied")
-        self.history_tree = ttk.Treeview(cont, columns=cols, show="headings")
+        self.history_tree = ttk.Treeview(cont, columns=cols, show="tree headings")
         for c, txt, w, anc in [
             ("when", "When", 160, "w"),
             ("scanned", "Scanned size", 140, "e"),
@@ -4029,7 +4093,7 @@ class CapacitraApp:
             self.history_tree.heading(c, text=txt)
             self.history_tree.column(c, width=w, anchor=anc)
         self.history_tree.heading("#0", text="Path")
-        self.history_tree.column("#0", width=400, anchor="w")
+        self.history_tree.column("#0", width=400, minwidth=200, anchor="w", stretch=True)
         vsb = ttk.Scrollbar(cont, orient="vertical",
                             command=self.history_tree.yview)
         self.history_tree.configure(yscrollcommand=vsb.set)
@@ -4245,7 +4309,7 @@ class CapacitraApp:
                  font=("Segoe UI Semibold", 22)).pack(anchor="w")
         tk.Label(col, text=APP_TAGLINE, bg=t["panel"], fg=t["accent"],
                  font=("Segoe UI", 12)).pack(anchor="w", pady=(2, 0))
-        tk.Label(col, text=f"Version {APP_VERSION}  ·  Build 2026.05",
+        tk.Label(col, text=f"Version {APP_VERSION}  ·  Build 2026.07",
                  bg=t["panel"], fg=t["muted"],
                  font=UI_FONT).pack(anchor="w", pady=(8, 0))
 
@@ -4700,7 +4764,8 @@ class CapacitraApp:
                 pass
 
         win = tk.Toplevel(self.root)
-        win.title("Properties — " + os.path.basename(path) or path)
+        win.title("Properties — " + (os.path.basename(path) or path))
+        win.minsize(520, 420)
         win.geometry("600x520")
         win.configure(bg=t["bg"])
         # Header
@@ -4974,6 +5039,7 @@ class CapacitraApp:
         win = tk.Toplevel(self.root)
         win.title("Compare with snapshot")
         win.geometry("980x600")
+        win.minsize(720, 480)
         win.configure(bg=t["bg"])
         # Header
         head = tk.Frame(win, bg=t["panel"], highlightthickness=1,
@@ -6135,6 +6201,12 @@ class CapacitraApp:
         else:
             groups = payload
             skipped_cloud = 0
+        # v4.3: expose groups so the "Duplicate clusters by folder"
+        # menu item has data to aggregate
+        try:
+            self._dup_result = list(groups)
+        except Exception:
+            self._dup_result = None
         self.dup_tree.delete(*self.dup_tree.get_children())
         self.status_icon.configure(fg=self.theme["success"])
         cloud_note = ""
