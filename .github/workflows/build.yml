@@ -78,7 +78,7 @@ jobs:
         run: |
           $hash = (Get-FileHash -Path dist\Capacitra.exe -Algorithm SHA256).Hash.ToLower()
           "sha256=$hash" >> $env:GITHUB_OUTPUT
-          "$hash  Capacitra.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          [IO.File]::WriteAllText("dist\SHA256SUMS.txt", "$hash  Capacitra.exe`n")
           Write-Host "Capacitra.exe SHA-256: $hash"
 
       - name: Upload build artifact
