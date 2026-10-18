@@ -11,7 +11,7 @@ Website: **[capacitra.com](https://capacitra.com)**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4.svg)](https://capacitra.com)
-[![Build](https://github.com/OWNER/capacitra/actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
+[![Build](https://github.com/Capacitra/capacitra/actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
 
 ---
 
@@ -44,7 +44,8 @@ Website: **[capacitra.com](https://capacitra.com)**
 - Schedule daily scans via Windows Task Scheduler
 - Recycle Bin, never hard-delete
 - Export to CSV, HTML, PDF, Excel
-- Light & Dark themes
+- Light & Dark themes (remembered between sessions)
+- Sharp at any Windows display scaling (100% to 200%)
 - Full keyboard support (`Ctrl+O` scan, `Ctrl+E` export, `F5` rescan,
   `Del` recycle, `Esc` cancel)
 - Headless CLI mode
@@ -107,10 +108,26 @@ Exit codes: `0` success, `1` usage error, `2` scan error, `3` export error.
 - Snapshots (`.capsnap`) use a `CAPSNAP1` magic header and a restricted
   unpickler that will refuse to construct arbitrary objects. Do not open
   snapshots from untrusted sources anyway.
-- CSV and Excel exports sanitise the classic Excel formula-injection
-  characters (`=`, `+`, `-`, `@`, tab, CR).
+- CSV and Excel exports sanitise formula-injection characters (`=`, `+`,
+  `-`, `@`, tab, CR, LF and their full-width variants).
+- Snapshots are validated on load: size cap, type checks, and every path
+  must sit inside the snapshot's own scan folder.
+- Recycle-only deletes. UNC/network paths and wildcards are refused, and
+  "Delete empty folders" re-checks each folder on disk first.
+- Opening an executable from the app asks for confirmation.
 
 Report vulnerabilities via [SECURITY.md](SECURITY.md).
+
+## Code signing policy
+
+Windows binaries of Capacitra are signed to guarantee that the `.exe`
+you downloaded was built from the source in this repository, and that
+the file was not tampered with in transit. See
+[SIGNING-POLICY.md](SIGNING-POLICY.md) for the full policy, the team
+roles, the privacy statement, and the reproducible-build workflow.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
 
 ## Contributing
 

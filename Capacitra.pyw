@@ -60,7 +60,7 @@ from tkinter import ttk, filedialog, messagebox
 
 APP_NAME = "Capacitra"
 APP_TAGLINE = "Storage capacity intelligence"
-APP_VERSION = "4.3.2"
+APP_VERSION = "4.4.0"
 
 
 # Optional dependency probes — done once at import so the UI can hide
@@ -141,6 +141,8 @@ def open_in_explorer(path):
     if sys.platform == "win32":
         try:
             norm = os.path.normpath(path)
+            if '"' in norm:
+                raise OSError("invalid path")
             # Strip the Win32 long-path prefix Explorer does not understand
             if norm.startswith("\\\\?\\"):
                 norm = norm[4:]
@@ -184,9 +186,23 @@ def _sanitize_cell(v):
     single quote. Prevents CSV/XLSX injection attacks where a filename
     like `=cmd|'/c calc'!A1` would auto-execute when the report is
     opened in Excel / LibreOffice / Numbers."""
-    if isinstance(v, str) and v and v[0] in ("=", "+", "-", "@", "\t", "\r"):
-        return "'" + v
+    if isinstance(v, str) and v:
+        head = v.lstrip(" ")
+        if head and head[0] in _FORMULA_TRIGGERS:
+            return "'" + v
     return v
+
+
+# Characters that make Excel / LibreOffice treat a cell as a formula,
+# including the full-width variants some localized builds accept.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n",
+                     "\uff1d", "\uff0b", "\uff0d", "\uff20")
+
+# Opening any of these with os.startfile() RUNS them.
+_EXECUTABLE_EXTS = {".exe", ".bat", ".cmd", ".com", ".lnk", ".ps1", ".vbs",
+                    ".vbe", ".js", ".jse", ".wsf", ".wsh", ".hta", ".msi",
+                    ".msp", ".scr", ".pif", ".jar", ".cpl", ".reg", ".appx",
+                    ".msix", ".appref-ms", ".url"}
 
 
 def open_path(path):
@@ -282,6 +298,10 @@ def send_to_recycle_bin(path):
     Returns True on success, False otherwise.
     """
     if sys.platform == "win32":
+        # Network shares and wildcard patterns have no undo: refuse them
+        # instead of letting the shell delete permanently.
+        if not path or path.startswith("\\\\") or any(c in path for c in "*?"):
+            return False
         try:
             from ctypes import (wintypes, windll, Structure,
                                 c_int, byref, c_wchar_p)
@@ -289,7 +309,10 @@ def send_to_recycle_bin(path):
             FOF_ALLOWUNDO = 0x0040
             FOF_NOCONFIRMATION = 0x0010
             FOF_SILENT = 0x0004
-            FOF_NOERRORUI = 0x0400
+            # If an item cannot go to the Recycle Bin (too large, drive
+            # without a bin, ...) Windows now ASKS before deleting it
+            # permanently instead of doing so silently.
+            FOF_WANTNUKEWARNING = 0x4000
 
             class SHFILEOPSTRUCTW(Structure):
                 _fields_ = [
@@ -297,7 +320,7 @@ def send_to_recycle_bin(path):
                     ("wFunc", wintypes.UINT),
                     ("pFrom", c_wchar_p),
                     ("pTo", c_wchar_p),
-                    ("fFlags", c_int),
+                    ("fFlags", wintypes.WORD),
                     ("fAnyOperationsAborted", wintypes.BOOL),
                     ("hNameMappings", wintypes.LPVOID),
                     ("lpszProgressTitle", c_wchar_p),
@@ -306,8 +329,9 @@ def send_to_recycle_bin(path):
             op.wFunc = FO_DELETE
             op.pFrom = path + "\0\0"
             op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION
-                         | FOF_SILENT | FOF_NOERRORUI)
-            return windll.shell32.SHFileOperationW(byref(op)) == 0
+                         | FOF_SILENT | FOF_WANTNUKEWARNING)
+            rc = windll.shell32.SHFileOperationW(byref(op))
+            return rc == 0 and not op.fAnyOperationsAborted
         except Exception:
             return False
     # macOS / Linux: require send2trash for a real (undoable) trash op.
@@ -417,7 +441,7 @@ PALETTE = [
 class Node:
     __slots__ = ("name", "path", "size", "allocated", "is_dir",
                  "children", "file_count", "folder_count",
-                 "parent", "mtime", "atime")
+                 "parent", "mtime", "atime", "incomplete")
 
     def __init__(self, name, path, is_dir=False, parent=None):
         self.name = name
@@ -431,6 +455,19 @@ class Node:
         self.parent = parent
         self.mtime = 0          # last modification time
         self.atime = 0          # last access time
+        # True when part of the folder could not be read or was skipped
+        # (permission denied, junction, excluded). Such folders are never
+        # reported as "empty".
+        self.incomplete = False
+
+    def __setstate__(self, state):
+        # Snapshots saved before v4.4 have no "incomplete" slot
+        if isinstance(state, tuple) and len(state) == 2:
+            state = state[1]
+        for k, v in (state or {}).items():
+            setattr(self, k, v)
+        if not hasattr(self, "incomplete"):
+            self.incomplete = False
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +589,23 @@ class ScanWorker(threading.Thread):
             return 0
         return ((size + cls._CLUSTER_SIZE - 1) // cls._CLUSTER_SIZE) * cls._CLUSTER_SIZE
 
+    _REPARSE_JUNCTION = 0xA0000003
+    _REPARSE_SYMLINK = 0xA000000C
+
+    def _is_link_dir(self, entry):
+        if sys.platform != "win32":
+            return False
+        try:
+            if hasattr(entry, "is_junction") and entry.is_junction():
+                return True
+            st = entry.stat(follow_symlinks=False)
+            if getattr(st, "st_file_attributes", 0) & 0x400:   # REPARSE_POINT
+                tag = getattr(st, "st_reparse_tag", 0)
+                return tag in (self._REPARSE_JUNCTION, self._REPARSE_SYMLINK)
+        except OSError:
+            return False
+        return False
+
     def _scan(self, node):
         if self.stop_event.is_set():
             return 0
@@ -571,6 +625,7 @@ class ScanWorker(threading.Thread):
                 entries = list(it)
         except (PermissionError, OSError):
             self.denied_count += 1
+            node.incomplete = True
             return 0
 
         for entry in entries:
@@ -578,10 +633,17 @@ class ScanWorker(threading.Thread):
                 return total
             try:
                 if entry.is_symlink():
+                    node.incomplete = True
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     # Skip excluded folder names (case-insensitive)
                     if entry.name.lower() in self.excludes:
+                        node.incomplete = True
+                        continue
+                    # Never follow NTFS junctions / directory symlinks
+                    # (they point outside the scan root and can loop).
+                    if self._is_link_dir(entry):
+                        node.incomplete = True
                         continue
                     self.total_dirs += 1
                     child = Node(entry.name, entry.path, is_dir=True, parent=node)
@@ -600,6 +662,7 @@ class ScanWorker(threading.Thread):
                         at = st.st_atime
                     except (PermissionError, OSError):
                         self.denied_count += 1
+                        node.incomplete = True
                         continue
                     f = Node(entry.name, entry.path, is_dir=False, parent=node)
                     f.size = sz
@@ -616,13 +679,7 @@ class ScanWorker(threading.Thread):
                     self.ext_stats[ext][1] += 1
                     self._bump_age((self.now - mt) / 86400.0, sz)
 
-                    if len(self.largest_files) < 1000:
-                        self._push_largest(sz, entry.path, mt)
-                        if len(self.largest_files) == 1000:
-                            self.largest_files.sort(key=lambda x: x[0])
-                    elif sz > self.largest_files[0][0]:
-                        self.largest_files[0] = (sz, entry.path, mt)
-                        self.largest_files.sort(key=lambda x: x[0])
+                    self._push_largest(sz, entry.path, mt)
 
                     if sz >= self.DUP_THRESHOLD:
                         self.size_groups[sz].append(entry.path)
@@ -1011,172 +1068,132 @@ class TreemapChart(BaseChart):
             return "…"
         return text[:max_chars - 1] + "…"
 
+    @staticmethod
+    def _tile_icon_name(node):
+        if node.path == "(free)":
+            return "drive"
+        if node.path == "(gap)":
+            return "lock"
+        if node.is_dir:
+            n = node.name.lower()
+            if n.startswith("user"):
+                return "user"
+            if n in ("windows", "winnt", "system32"):
+                return "windows"
+            return "folder"
+        ext = os.path.splitext(node.name)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+                   ".heic", ".bmp"):
+            return "image"
+        if ext in (".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv"):
+            return "video"
+        if ext in (".mp3", ".wav", ".flac", ".m4a", ".aac"):
+            return "music"
+        if ext in (".zip", ".rar", ".7z", ".iso", ".tar", ".gz"):
+            return "box"
+        if ext in (".exe", ".msi", ".dll", ".sys"):
+            return "bolt"
+        return "file"
+
     def _draw_rect(self, node, x, y, w, h, idx):
+        """Draw one treemap tile.
+
+        v4.4: text layout is measured with real font metrics, so labels
+        never overlap each other or spill outside the tile at any display
+        scaling. Elements that don't fit are dropped (percent first, then
+        size, then name)."""
         if w < 1 or h < 1:
             return
-        # Compute "% of parent" — total sum of all visible tiles.
         total = sum(max(n.size, 1) for n in self._data) or 1
         pct = node.size / total * 100
         color = self._tile_color(node, idx)
-
-        # ---- Rounded tile (with a small inset gutter between cards) ----
-        inset = 5
-        r = max(6, min(18, h * 0.06, w * 0.06))
+        S = UI_SCALE
+        inset = max(2, int(2.5 * S))
         x1, y1 = x + inset, y + inset
         x2, y2 = x + w - inset, y + h - inset
-        iw = x2 - x1
-        ih = y2 - y1
+        iw, ih = x2 - x1, y2 - y1
+        if iw < 2 or ih < 2:
+            return
+        r = max(2, min(10 * S, ih * 0.08, iw * 0.08))
         rect = self.create_polygon(
             self._round_rect_points(x1, y1, x2, y2, r),
             smooth=True, fill=color, outline="")
+        text_id = rect
+        pad = 10 * S
+        avail_w = iw - 2 * pad
+        avail_h = ih - 2 * pad
+        sub = self._lighten(color, 0.78)
+        if avail_w >= 34 * S and avail_h >= 12 * S:
+            big = iw >= 240 * S and ih >= 150 * S
+            med = iw >= 120 * S and ih >= 64 * S
+            if big:
+                f_name = ui_font(self, "Segoe UI Semibold", 12)
+                f_size = ui_font(self, "Segoe UI Semibold", 22)
+                f_meta = ui_font(self, "Segoe UI", 9)
+            elif med:
+                f_name = ui_font(self, "Segoe UI Semibold", 10)
+                f_size = ui_font(self, "Segoe UI Semibold", 14)
+                f_meta = ui_font(self, "Segoe UI", 8)
+            else:
+                f_name = ui_font(self, "Segoe UI Semibold", 9)
+                f_size = ui_font(self, "Segoe UI", 8)
+                f_meta = None
+            icon_sz = int(26 * S) if big else 0
+            items = [("name", node.name, f_name, "white")]
+            items.append(("size", human_size(node.size), f_size, "white"))
+            if f_meta is not None:
+                items.append(("meta", f"{pct:.1f}%", f_meta, sub))
+            gap = 3 * S
 
-        # ---- Decorative dot pattern (top-left, very subtle) ----
-        if w > 120 and h > 90:
-            for i in range(3):
-                for j in range(3):
-                    self.create_oval(
-                        x1 + 10 + i * 10, y1 + 10 + j * 10,
-                        x1 + 12 + i * 10, y1 + 12 + j * 10,
-                        fill=self._lighten(color, 0.3), outline="")
+            def block_h(its):
+                hh = sum(f.metrics("linespace") for _, _, f, _ in its)
+                hh += gap * max(0, len(its) - 1)
+                if icon_sz:
+                    hh += icon_sz + 8 * S
+                return hh
 
-        # ---- Pick a layout depending on tile size ----
-        text_id = None
-        icon = self._tile_icon(node)
-
-        if iw >= 300 and ih >= 220:
-            # BIG tile — centered icon (large) + stacked text
-            cx = (x1 + x2) / 2
-            cy_icon = y1 + ih * 0.30
-            # Glass circle behind icon
-            cr = min(48, ih * 0.12)
-            self.create_oval(cx - cr, cy_icon - cr,
-                             cx + cr, cy_icon + cr,
-                             fill=self._lighten(color, 0.5), outline="")
-            self.create_text(cx, cy_icon, text=icon,
-                             font=("Segoe UI Emoji", int(cr * 0.95)),
-                             fill="white")
-            # Name (top of text block) — truncated to fit
-            ty = cy_icon + cr + 26
-            max_chars = max(10, int((iw - 30) / 9))
-            self.create_text(cx, ty,
-                             text=self._trunc(node.name, max_chars),
-                             fill="white",
-                             font=("Segoe UI Semibold", 16))
-            # Size — huge
-            self.create_text(cx, ty + 34, text=human_size(node.size),
-                             fill="white",
-                             font=("Segoe UI Semibold", 26))
-            # Percent chip
-            chip_w, chip_h = 70, 24
-            cy_chip = ty + 80
-            self.create_polygon(
-                self._round_rect_points(cx - chip_w/2, cy_chip - chip_h/2,
-                                        cx + chip_w/2, cy_chip + chip_h/2,
-                                        chip_h/2),
-                smooth=True, fill=self._lighten(color, 0.5), outline="")
-            self.create_text(cx, cy_chip, text=f"{pct:.1f}%",
-                             fill="white",
-                             font=("Segoe UI Semibold", 11))
-            # Inline progress bar
-            bw_total = min(w * 0.55, 240)
-            bx = cx - bw_total / 2
-            by = cy_chip + 26
-            self.create_polygon(
-                self._round_rect_points(bx, by, bx + bw_total, by + 6, 3),
-                smooth=True, fill=self._lighten(color, 0.3), outline="")
-            fill_w = max(bw_total * pct / 100, 6)
-            self.create_polygon(
-                self._round_rect_points(bx, by, bx + fill_w, by + 6, 3),
-                smooth=True, fill="#FFFFFF", outline="")
-            text_id = rect
-        elif iw >= 180 and ih >= 100 and iw >= ih * 1.15:
-            # WIDE-MEDIUM tile — icon left, stacked text right
-            cr = min(28, ih * 0.18)
-            cx_icon = x1 + 14 + cr
-            cy_icon = (y1 + y2) / 2
-            self.create_oval(cx_icon - cr, cy_icon - cr,
-                             cx_icon + cr, cy_icon + cr,
-                             fill=self._lighten(color, 0.5), outline="")
-            self.create_text(cx_icon, cy_icon, text=icon,
-                             font=("Segoe UI Emoji", int(cr * 0.95)),
-                             fill="white")
-            tx = cx_icon + cr + 14
-            ty = y1 + 14
-            text_avail = max(iw - (tx - x1) - 12, 30)
-            max_chars = max(8, int(text_avail / 7.2))
-            self.create_text(tx, ty, anchor="nw",
-                             text=self._trunc(node.name, max_chars),
-                             fill="white",
-                             font=("Segoe UI Semibold", 12))
-            self.create_text(tx, ty + 24, anchor="nw",
-                             text=human_size(node.size),
-                             fill="white",
-                             font=("Segoe UI Semibold", 17))
-            # Percent only when tile is comfortably tall
-            if ih >= 150:
-                self.create_text(tx, ty + 58, anchor="nw",
-                                 text=f"{pct:.1f}%",
-                                 fill=self._lighten(color, 0.85),
-                                 font=("Segoe UI", 10))
-                bw_total = iw - 28
-                bx = x1 + 14
-                by = y2 - 12
-                self.create_polygon(
-                    self._round_rect_points(bx, by, bx + bw_total, by + 4, 2),
-                    smooth=True, fill=self._lighten(color, 0.3), outline="")
-                fill_w = max(bw_total * pct / 100, 4)
-                self.create_polygon(
-                    self._round_rect_points(bx, by, bx + fill_w, by + 4, 2),
-                    smooth=True, fill="#FFFFFF", outline="")
-            text_id = rect
-        elif iw >= 110 and ih >= 130:
-            # TALL-MEDIUM tile — icon on TOP, text below (centred)
-            cx = (x1 + x2) / 2
-            cr = min(22, ih * 0.13, iw * 0.18)
-            cy_icon = y1 + cr + 14
-            self.create_oval(cx - cr, cy_icon - cr,
-                             cx + cr, cy_icon + cr,
-                             fill=self._lighten(color, 0.5), outline="")
-            self.create_text(cx, cy_icon, text=icon,
-                             font=("Segoe UI Emoji", int(cr * 0.9)),
-                             fill="white")
-            max_chars = max(6, int((iw - 16) / 7))
-            self.create_text(cx, cy_icon + cr + 14,
-                             text=self._trunc(node.name, max_chars),
-                             fill="white",
-                             font=("Segoe UI Semibold", 10))
-            self.create_text(cx, cy_icon + cr + 36,
-                             text=human_size(node.size),
-                             fill="white",
-                             font=("Segoe UI Semibold", 12))
-            # Percent only when tile is very tall — else it visually
-            # collides with the size text above.
-            if ih >= 210:
-                self.create_text(cx, cy_icon + cr + 72,
-                                 text=f"{pct:.1f}%",
-                                 fill=self._lighten(color, 0.85),
-                                 font=("Segoe UI", 9))
-            text_id = rect
-        elif iw >= 80 and ih >= 38:
-            # SMALL tile — truncated name (no wrap) + size (if room)
-            tx = x1 + 8
-            ty = y1 + 6
-            # Aggressive char cap so size text never runs off the edge
-            max_chars = max(3, int((iw - 12) / 7.4))
-            self.create_text(tx, ty, anchor="nw",
-                             text=self._trunc(node.name, max_chars),
-                             fill="white",
-                             font=("Segoe UI Semibold", 9))
-            # Only draw size when tile is wide AND tall enough to fit it
-            # (14pt font ~ 65 px wide for "1024 MB" or "5.89 GB")
-            if iw >= 120 and ih >= 46:
-                self.create_text(tx, ty + 16, anchor="nw",
-                                 text=human_size(node.size),
-                                 fill="white",
-                                 font=("Segoe UI Semibold", 10))
-            text_id = rect
-        # else: very small — no text, just the coloured tile
-
+            while items and block_h(items) > avail_h:
+                if icon_sz:
+                    icon_sz = 0
+                    continue
+                items.pop()
+            if items:
+                if big:
+                    # centred block
+                    bh = block_h(items)
+                    cy = y1 + (ih - bh) / 2
+                    cx = (x1 + x2) / 2
+                    if icon_sz:
+                        draw_icon(self, self._tile_icon_name(node),
+                                  cx - icon_sz / 2, cy, icon_sz, "white",
+                                  color)
+                        cy += icon_sz + 8 * S
+                    for _, txt, f, fg in items:
+                        t = fit_text(f, txt, avail_w)
+                        self.create_text(cx, cy, text=t, font=f, fill=fg,
+                                         anchor="n")
+                        cy += f.metrics("linespace") + gap
+                    # thin usage bar under the block
+                    if cy + 6 * S < y2 - pad / 2:
+                        bw = min(iw * 0.5, 220 * S)
+                        bx = cx - bw / 2
+                        by = cy + 4 * S
+                        self.create_rectangle(bx, by, bx + bw, by + 3 * S,
+                                              fill=self._lighten(color, 0.35),
+                                              outline="")
+                        self.create_rectangle(
+                            bx, by, bx + max(bw * pct / 100, 3 * S),
+                            by + 3 * S, fill="white", outline="")
+                else:
+                    cy = y1 + pad * 0.8
+                    tx = x1 + pad
+                    for _, txt, f, fg in items:
+                        t = fit_text(f, txt, avail_w)
+                        if not t:
+                            break
+                        self.create_text(tx, cy, text=t, font=f, fill=fg,
+                                         anchor="nw")
+                        cy += f.metrics("linespace") + gap
         self._items.append((rect, text_id, node, (x, y, x + w, y + h)))
 
     def _on_motion(self, event):
@@ -1219,24 +1236,49 @@ class PieChart(BaseChart):
             x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
         ]
 
+    def _tints(self, base):
+        """Theme-aware chip tint (pastel on light, deep on dark)."""
+        return _mix(base, self.theme["panel"], 0.84)
+
     def redraw(self):
         self.delete("all")
         self._slices = []
+        self._geom = None
         data = self._data
         w = self.winfo_width()
         h = self.winfo_height()
-        if not data:
+        if not data or w < 20 or h < 20:
             self.create_text(w / 2, h / 2, text="No data",
                              fill=self.theme["muted"], font=UI_FONT)
             return
         total = sum(max(v, 0) for _, v, *_ in data)
         if total <= 0:
             return
-        # Donut on the left
-        size = min(w * 0.42, h * 0.92)
-        cx = w * 0.22
-        cy = h / 2
-        r = size / 2
+        S = UI_SCALE
+        f_row = ui_font(self, "Segoe UI", 9)
+        f_row_b = ui_font(self, "Segoe UI", 9, "bold")
+        f_head = ui_font(self, "Segoe UI Semibold", 11)
+        f_chip = ui_font(self, "Segoe UI Semibold", 8)
+        row_h = f_row.metrics("linespace") + 10 * S
+        side_by_side = w >= 520 * S
+        pad = 16 * S
+        if side_by_side:
+            donut_box = min(w * 0.42, h - 2 * pad)
+            cx = pad + donut_box / 2
+            cy = h / 2
+            lx = pad * 2 + donut_box
+            lw = w - lx - pad
+            ly = pad
+            lh = h - 2 * pad
+        else:
+            donut_box = min(w - 2 * pad, h * 0.5)
+            cx = w / 2
+            cy = pad + donut_box / 2
+            lx = pad
+            lw = w - 2 * pad
+            ly = pad * 2 + donut_box
+            lh = h - ly - pad
+        r = max(donut_box / 2, 10)
         bbox = (cx - r, cy - r, cx + r, cy + r)
         start = 90.0
         for i, item in enumerate(data):
@@ -1244,65 +1286,86 @@ class PieChart(BaseChart):
             base_color, _ = self.CHIP_TINTS[i % len(self.CHIP_TINTS)]
             color = item[2] if len(item) >= 3 else base_color
             extent = -value / total * 360.0
+            if abs(extent) >= 359.99:
+                extent = -359.99
             self.create_arc(*bbox, start=start, extent=extent, fill=color,
                             outline=self.theme["panel"], width=2)
             self._slices.append((start, extent, label, value, color))
             start += extent
-        ir = r * 0.58
+        ir = r * 0.6
         self.create_oval(cx - ir, cy - ir, cx + ir, cy + ir,
                          fill=self.theme["panel"], outline="")
-        self.create_text(cx, cy - 8, text=human_size(total),
-                         font=("Segoe UI Semibold", 18),
-                         fill=self.theme["chart_text"])
-        self.create_text(cx, cy + 16, text="Total",
-                         font=UI_FONT, fill=self.theme["muted"])
-        # Breakdown column on the right (with tinted % chips)
-        lx = w * 0.50
-        ly = h * 0.08
+        self._geom = (cx, cy, r, ir)
+        # Centre label: largest font that fits inside the hole
+        txt = human_size(total)
+        f_center = None
+        for sz in (20, 17, 14, 12, 10, 9):
+            f = ui_font(self, "Segoe UI Semibold", sz)
+            if f.measure(txt) <= ir * 1.6:
+                f_center = f
+                break
+        if f_center is not None and ir > 18 * S:
+            lsp = f_center.metrics("linespace")
+            self.create_text(cx, cy - lsp * 0.25, text=txt, font=f_center,
+                             fill=self.theme["chart_text"])
+            if ir > 40 * S:
+                self.create_text(cx, cy + lsp * 0.55, text="Total",
+                                 font=f_row, fill=self.theme["muted"])
+        # Legend
+        if lw < 120 * S or lh < row_h:
+            return
         self.create_text(lx, ly, anchor="nw", text="Breakdown",
-                         font=("Segoe UI Semibold", 12),
-                         fill=self.theme["chart_text"])
-        line_y = ly + 28
-        max_lines = int((h - line_y - 16) / 28)
-        for i, item in enumerate(data[:max(max_lines, 1)]):
+                         font=f_head, fill=self.theme["chart_text"])
+        y0 = ly + f_head.metrics("linespace") + 8 * S
+        max_rows = max(0, int((ly + lh - y0) // row_h))
+        rows = list(enumerate(data))
+        more = 0
+        if len(rows) > max_rows:
+            more = len(rows) - max(max_rows - 1, 0)
+            rows = rows[:max(max_rows - 1, 0)]
+        chip_w = f_chip.measure("100.0%") + 14 * S
+        size_w = f_row_b.measure("999.9 MB") + 6 * S
+        name_w = lw - 18 * S - size_w - chip_w - 16 * S
+        for k, (i, item) in enumerate(rows):
             label, value = item[0], item[1]
-            base_color, tint = self.CHIP_TINTS[i % len(self.CHIP_TINTS)]
-            pct = value / total * 100
-            yy = line_y + i * 28
-            # color dot
-            self.create_oval(lx, yy + 4, lx + 12, yy + 16,
+            base_color, _ = self.CHIP_TINTS[i % len(self.CHIP_TINTS)]
+            pctv = value / total * 100
+            yc = y0 + k * row_h + row_h / 2
+            d = 5 * S
+            self.create_oval(lx, yc - d, lx + 2 * d, yc + d,
                              fill=base_color, outline="")
-            # name
-            short = label if len(label) <= 16 else label[:13] + "…"
-            self.create_text(lx + 20, yy + 10, anchor="w",
-                             text=short, font=UI_FONT,
+            self.create_text(lx + 18 * S, yc, anchor="w",
+                             text=fit_text(f_row, label, name_w),
+                             font=f_row, fill=self.theme["chart_text"])
+            chip_x2 = lx + lw
+            chip_x1 = chip_x2 - chip_w
+            self.create_text(chip_x1 - 8 * S, yc, anchor="e",
+                             text=human_size(value), font=f_row_b,
                              fill=self.theme["chart_text"])
-            # tinted % chip at fixed right offset
-            chip_x1 = lx + 290
-            chip_x2 = chip_x1 + 56
-            # size right-anchored, with guaranteed 10px gap before chip
-            self.create_text(chip_x1 - 10, yy + 10, anchor="e",
-                             text=human_size(value),
-                             font=UI_FONT_BOLD,
-                             fill=self.theme["chart_text"])
+            ch = f_chip.metrics("linespace") + 4 * S
             self.create_polygon(
-                self._rrpts(chip_x1, yy + 2, chip_x2, yy + 18, 9),
-                smooth=True, fill=tint, outline="")
-            self.create_text((chip_x1 + chip_x2) / 2, yy + 10,
-                             text=f"{pct:.1f}%", fill=base_color,
-                             font=("Segoe UI Semibold", 9))
+                self._rrpts(chip_x1, yc - ch / 2, chip_x2, yc + ch / 2,
+                            ch / 2),
+                smooth=True, fill=self._tints(base_color), outline="")
+            self.create_text((chip_x1 + chip_x2) / 2, yc,
+                             text=f"{pctv:.1f}%", fill=base_color,
+                             font=f_chip)
+        if more:
+            yc = y0 + len(rows) * row_h + row_h / 2
+            self.create_text(lx + 18 * S, yc, anchor="w",
+                             text=f"+ {more} more", font=f_row,
+                             fill=self.theme["muted"])
 
     def _on_motion(self, event):
-        w = self.winfo_width()
-        h = self.winfo_height()
-        size = min(w * 0.55, h * 0.85)
-        cx = w * 0.3
-        cy = h / 2
-        r = size / 2
+        g = getattr(self, "_geom", None)
+        if not g:
+            self._hide_tip()
+            return
+        cx, cy, r, ir = g
         dx = event.x - cx
         dy = event.y - cy
         dist = math.hypot(dx, dy)
-        if dist > r or dist < r * 0.55:
+        if dist > r or dist < ir:
             self._hide_tip()
             return
         ang = math.degrees(math.atan2(-dy, dx))
@@ -1318,6 +1381,7 @@ class PieChart(BaseChart):
                                f"{label}\n{human_size(value)}")
                 return
         self._hide_tip()
+
 
 
 class BarChart(BaseChart):
@@ -1361,108 +1425,95 @@ class BarChart(BaseChart):
             return
         w = self.winfo_width()
         h = self.winfo_height()
-        # Column widths
-        icon_w  = 28
-        name_w  = 180
-        size_w  = 90
-        chip_w  = 70
-        gap     = 12
-        margin_l = 18
-        margin_r = 18
-        margin_t = 12
-        margin_b = 12
+        S = UI_SCALE
+        f_row = ui_font(self, "Segoe UI", 9)
+        f_row_b = ui_font(self, "Segoe UI", 9, "bold")
+        f_chip = ui_font(self, "Segoe UI Semibold", 8)
+        icon_w = 26 * S
+        gap = 12 * S
+        margin_l = margin_r = 16 * S
+        margin_t = margin_b = 10 * S
+        size_w = f_row_b.measure("999.9 MB") + 4 * S
+        chip_w = f_chip.measure("100.0%") + 16 * S
+        name_w = max(90 * S, min(240 * S, w * 0.24))
         bar_x1 = margin_l + icon_w + gap + name_w + gap
         bar_x2 = w - margin_r - chip_w - gap - size_w - gap
-        bar_total = max(bar_x2 - bar_x1, 60)
+        bar_total = max(bar_x2 - bar_x1, 40 * S)
         n = len(data)
-        avail_h = max(h - margin_t - margin_b, 50)
-        row_h = min(34, (avail_h - (n - 1) * 6) / max(n, 1))
-        if row_h < 14:
-            row_h = max(14, (avail_h - (n - 1) * 3) / n)
+        avail_h = max(h - margin_t - margin_b, 40)
+        min_row = f_row.metrics("linespace") + 8 * S
+        row_h = min(34 * S, max(min_row, (avail_h - (n - 1) * 6 * S) / max(n, 1)))
+        fit = max(1, int((avail_h + 6 * S) // (row_h + 6 * S)))
+        rows = data[:fit]
         max_val = max((v for _, v, *_ in data), default=1) or 1
         sum_total = sum(v for _, v, *_ in data) or 1
-        for i, item in enumerate(data):
+        for i, item in enumerate(rows):
             label, value = item[0], item[1]
-            base_color, tint = self.CHIP_TINTS[i % len(self.CHIP_TINTS)]
-            y = margin_t + i * (row_h + 6)
+            base_color, _ = self.CHIP_TINTS[i % len(self.CHIP_TINTS)]
+            tint = _mix(base_color, self.theme["panel"], 0.84)
+            y = margin_t + i * (row_h + 6 * S)
             yc = y + row_h / 2
-            # Icon (a small filled rounded square with a single emoji)
-            icon = self._guess_icon(label)
-            ix1 = margin_l
-            ix2 = margin_l + icon_w
+            ix1, ix2 = margin_l, margin_l + icon_w
+            isz = min(icon_w, row_h - 4 * S)
             self.create_polygon(
-                self._rrpts(ix1, y + 4, ix2, y + row_h - 4, 6),
+                self._rrpts(ix1, yc - isz / 2, ix1 + isz, yc + isz / 2,
+                            6 * S),
                 smooth=True, fill=tint, outline="")
-            self.create_text((ix1 + ix2) / 2, yc, text=icon,
-                             fill=base_color,
-                             font=("Segoe UI Emoji", 12))
-            # Name
-            short = label if len(label) <= 32 else label[:29] + "…"
+            ip = isz * 0.2
+            draw_icon(self, self._guess_icon_name(label), ix1 + ip,
+                      yc - isz / 2 + ip, isz - 2 * ip, base_color, tint)
             self.create_text(margin_l + icon_w + gap, yc, anchor="w",
-                             text=short, font=UI_FONT,
-                             fill=self.theme["fg"])
-            # Track
+                             text=fit_text(f_row, label, name_w),
+                             font=f_row, fill=self.theme["fg"])
+            th = 5 * S
             self.create_polygon(
-                self._rrpts(bar_x1, yc - 5, bar_x1 + bar_total, yc + 5, 5),
+                self._rrpts(bar_x1, yc - th, bar_x1 + bar_total, yc + th, th),
                 smooth=True, fill=self.theme["panel_alt"], outline="")
-            # Fill
-            bw = max(bar_total * value / max_val, 6)
+            bw = max(bar_total * value / max_val, 2 * th)
             rect = self.create_polygon(
-                self._rrpts(bar_x1, yc - 5, bar_x1 + bw, yc + 5, 5),
+                self._rrpts(bar_x1, yc - th, bar_x1 + bw, yc + th, th),
                 smooth=True, fill=base_color, outline="")
-            # Size text
             self.create_text(bar_x2 + gap, yc, anchor="w",
-                             text=human_size(value), font=UI_FONT_BOLD,
+                             text=human_size(value), font=f_row_b,
                              fill=self.theme["fg"])
-            # Percent chip (rounded pill, tinted bg)
             cx1 = w - margin_r - chip_w
             cx2 = w - margin_r
-            cy1 = yc - 10
-            cy2 = yc + 10
+            ch = f_chip.metrics("linespace") + 5 * S
             self.create_polygon(
-                self._rrpts(cx1, cy1, cx2, cy2, 10),
+                self._rrpts(cx1, yc - ch / 2, cx2, yc + ch / 2, ch / 2),
                 smooth=True, fill=tint, outline="")
             pct = value / sum_total * 100
             self.create_text((cx1 + cx2) / 2, yc, text=f"{pct:.1f}%",
-                             fill=base_color,
-                             font=("Segoe UI Semibold", 9))
+                             fill=base_color, font=f_chip)
             self._bars.append(
                 (rect, label, value,
                  (margin_l, y, w - margin_r, y + row_h)))
 
     @staticmethod
-    def _guess_icon(name):
+    def _guess_icon_name(name):
         n = name.lower()
-        if n == "free space" or n.startswith("[free"):
-            return "🖴"
+        if n.startswith("[free"):
+            return "drive"
         if "inaccessib" in n:
-            return "🔒"
+            return "lock"
         if n.startswith("user"):
-            return "👤"
+            return "user"
         if n in ("windows", "winnt", "system32"):
-            return "🪟"
-        if "program" in n:
-            return "📁"
-        if "recovery" in n:
-            return "💾"
+            return "windows"
         ext = os.path.splitext(name)[1].lower() if "." in name else ""
-        if ext in (".sys", ".dll"):
-            return "🛠"
-        if ext in (".jpg", ".png", ".gif", ".webp"):
-            return "🖼"
-        if ext in (".mp4", ".mov", ".avi"):
-            return "🎬"
+        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic"):
+            return "image"
+        if ext in (".mp4", ".mov", ".avi", ".mkv"):
+            return "video"
         if ext in (".mp3", ".wav", ".flac"):
-            return "🎵"
-        if ext in (".zip", ".rar", ".7z"):
-            return "📦"
-        if ext in (".exe", ".msi"):
-            return "⚡"
-        if ext in (".log", ".tmp"):
-            return "📝"
+            return "music"
+        if ext in (".zip", ".rar", ".7z", ".iso"):
+            return "box"
+        if ext in (".exe", ".msi", ".dll", ".sys"):
+            return "bolt"
         if ext:
-            return "📄"
-        return "📁"
+            return "file"
+        return "folder"
 
     def _on_motion(self, event):
         for rect, label, value, bb in self._bars:
@@ -1634,6 +1685,444 @@ class OverviewCanvas(BaseChart):
 # Ribbon button (icon over label, hover effect)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# v4.4 — DPI scaling + vector line icons
+#
+# Pixel constants (sidebar width, column widths, dialog sizes) used to be
+# fixed while fonts grew with Windows display scaling. At 125-200 % that
+# made text overflow its boxes. UI_SCALE fixes this: every hard-coded pixel
+# value is multiplied by the real DPI factor (see _install_dpi_scaling).
+#
+# Emoji glyphs rendered differently on every Windows build (monochrome on
+# Windows 10, missing on some LTSC images). They are replaced by crisp line
+# icons drawn on a Canvas, in the same style as the website icon set.
+# ---------------------------------------------------------------------------
+
+UI_SCALE = 1.0
+
+
+def _ui_scale(widget=None):
+    """Return the display scale factor (1.0 = 96 DPI)."""
+    if widget is None:
+        return UI_SCALE
+    try:
+        return max(1.0, float(widget.winfo_fpixels("1i")) / 96.0)
+    except Exception:
+        return UI_SCALE
+
+
+def px(n):
+    """Scale a 96-DPI pixel constant to the current display."""
+    return int(round(n * UI_SCALE))
+
+
+def _mix(c1, c2, t):
+    """Blend hex colour c1 towards c2 by t (0..1)."""
+    try:
+        a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    except (ValueError, IndexError, TypeError):
+        return c1
+    m = [int(a[k] + (b[k] - a[k]) * t) for k in range(3)]
+    return "#%02X%02X%02X" % tuple(m)
+
+
+_FONT_CACHE = {}
+
+
+def ui_font(widget, family="Segoe UI", size=9, weight="normal"):
+    """Cached tkinter Font object (needed for measure()/metrics())."""
+    import tkinter.font as tkfont
+    key = (str(widget.tk), family, size, weight)
+    f = _FONT_CACHE.get(key)
+    if f is None:
+        f = tkfont.Font(root=widget, family=family, size=size, weight=weight)
+        _FONT_CACHE[key] = f
+    return f
+
+
+def fit_text(font, text, max_w):
+    """Truncate *text* with an ellipsis so it fits in max_w pixels."""
+    text = str(text)
+    if max_w <= 0:
+        return ""
+    if font.measure(text) <= max_w:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.measure(text[:mid] + "…") <= max_w:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (text[:lo] + "…") if lo > 0 else ""
+
+
+_GLYPH_TO_ICON = {
+    "🏠": "home", "⌂": "home", "🗺": "treemap", "📊": "chart",
+    "⎘": "copy", "📦": "box", "🏷": "tag", "📤": "export",
+    "⚙": "settings", "🕓": "history", "ⓘ": "info", "🔍": "search",
+    "↻": "refresh", "🌙": "moon", "☾": "moon", "☀": "sun", "⋮": "more",
+    "↑": "up", "🎨": "palette", "🖴": "drive", "■": "stop", "✕": "close",
+    "✓": "check", "💾": "save", "→": "arrow", "📁": "folder",
+    "🗑": "trash", "📄": "file", "🔒": "lock", "⚡": "bolt",
+    "🖼": "image", "🎬": "video", "🎵": "music", "🛠": "gear_file",
+    "👤": "user", "🪟": "windows", "📝": "file", "⚠": "warn",
+    "📂": "folder", "🔎": "search", "⛃": "filter", "▦": "chart",
+    "⛶": "expand", "❔": "file", "</>": "code",
+}
+
+ICON_NAMES = {
+    "home", "treemap", "chart", "copy", "box", "tag", "export", "settings",
+    "history", "info", "search", "refresh", "moon", "sun", "more", "up",
+    "palette", "drive", "stop", "close", "check", "save", "arrow", "folder",
+    "trash", "file", "lock", "bolt", "image", "video", "music", "gear_file",
+    "user", "windows", "warn", "menu", "columns", "eye", "code", "expand",
+    "filter",
+}
+
+
+def icon_name(glyph):
+    if glyph in ICON_NAMES:
+        return glyph
+    return _GLYPH_TO_ICON.get(glyph)
+
+
+def draw_icon(c, name, x, y, s, color, bg="#FFFFFF"):
+    """Draw line icon *name* inside the box (x, y)-(x+s, y+s)."""
+    import math as _m
+    w = max(1.3, s / 11.5)
+
+    def P(fx, fy):
+        return (x + fx * s, y + fy * s)
+
+    def line(*pts, **kw):
+        flat = []
+        for p in pts:
+            flat.extend(P(*p))
+        o = dict(fill=color, width=w, capstyle="round", joinstyle="round")
+        o.update(kw)
+        c.create_line(*flat, **o)
+
+    def rect(x1, y1, x2, y2, **kw):
+        o = dict(outline=color, width=w)
+        o.update(kw)
+        c.create_rectangle(*P(x1, y1), *P(x2, y2), **o)
+
+    def oval(x1, y1, x2, y2, **kw):
+        o = dict(outline=color, width=w)
+        o.update(kw)
+        c.create_oval(*P(x1, y1), *P(x2, y2), **o)
+
+    def dot(fx, fy, rr=0.06):
+        oval(fx - rr, fy - rr, fx + rr, fy + rr, fill=color, outline="")
+
+    def arc(x1, y1, x2, y2, start, extent, **kw):
+        o = dict(outline=color, width=w, style="arc")
+        o.update(kw)
+        c.create_arc(*P(x1, y1), *P(x2, y2), start=start, extent=extent, **o)
+
+    n = name
+    if n == "home":
+        line((.12, .5), (.5, .15), (.88, .5))
+        line((.24, .4), (.24, .86), (.76, .86), (.76, .4))
+        line((.42, .86), (.42, .62), (.58, .62), (.58, .86))
+    elif n == "treemap":
+        rect(.13, .17, .87, .83)
+        line((.5, .17), (.5, .83))
+        line((.5, .5), (.87, .5))
+        line((.69, .5), (.69, .83))
+    elif n == "chart":
+        line((.12, .86), (.88, .86))
+        for fx, top in ((.27, .55), (.5, .2), (.73, .4)):
+            line((fx, .76), (fx, top), width=w * 2.3, capstyle="round")
+    elif n == "copy":
+        rect(.32, .32, .86, .86)
+        line((.14, .68), (.14, .14), (.68, .14))
+    elif n == "box":
+        line((.5, .12), (.86, .3), (.86, .72), (.5, .9), (.14, .72),
+             (.14, .3), (.5, .12))
+        line((.14, .3), (.5, .48), (.86, .3))
+        line((.5, .48), (.5, .9))
+    elif n == "tag":
+        line((.14, .14), (.52, .14), (.88, .5), (.5, .88), (.14, .52),
+             (.14, .14))
+        dot(.33, .33, .065)
+    elif n == "export":
+        line((.5, .64), (.5, .12))
+        line((.31, .31), (.5, .12), (.69, .31))
+        line((.16, .56), (.16, .86), (.84, .86), (.84, .56))
+    elif n in ("settings", "gear_file"):
+        for i in range(8):
+            a = _m.radians(i * 45)
+            line((.5 + .31 * _m.cos(a), .5 + .31 * _m.sin(a)),
+                 (.5 + .42 * _m.cos(a), .5 + .42 * _m.sin(a)),
+                 width=w * 1.9, capstyle="butt")
+        oval(.22, .22, .78, .78)
+        oval(.4, .4, .6, .6)
+    elif n == "history":
+        arc(.12, .12, .88, .88, 150, -300)
+        line((.5, .3), (.5, .5), (.66, .6))
+        line((.07, .3), (.17, .4), (.29, .28))
+    elif n == "info":
+        oval(.12, .12, .88, .88)
+        line((.5, .47), (.5, .7))
+        dot(.5, .32, .055)
+    elif n == "search":
+        oval(.14, .14, .64, .64)
+        line((.58, .58), (.86, .86), width=w * 1.25)
+    elif n == "refresh":
+        arc(.16, .16, .84, .84, 70, -300)
+        line((.5, .05), (.63, .17), (.5, .29))
+    elif n == "moon":
+        oval(.16, .16, .84, .84, fill=color, outline="")
+        oval(.34, .06, .98, .7, fill=bg, outline="")
+    elif n == "sun":
+        oval(.32, .32, .68, .68)
+        for i in range(8):
+            a = _m.radians(i * 45)
+            line((.5 + .28 * _m.cos(a), .5 + .28 * _m.sin(a)),
+                 (.5 + .42 * _m.cos(a), .5 + .42 * _m.sin(a)))
+    elif n == "more":
+        for fy in (.2, .5, .8):
+            dot(.5, fy, .075)
+    elif n == "menu":
+        for fy in (.26, .5, .74):
+            line((.16, fy), (.84, fy))
+    elif n == "up":
+        line((.5, .86), (.5, .16))
+        line((.24, .42), (.5, .16), (.76, .42))
+    elif n == "arrow":
+        line((.16, .5), (.84, .5))
+        line((.58, .24), (.84, .5), (.58, .76))
+    elif n == "palette":
+        oval(.12, .14, .88, .86)
+        for fx, fy in ((.34, .36), (.55, .28), (.7, .44), (.36, .6)):
+            dot(fx, fy, .06)
+    elif n == "drive":
+        rect(.1, .3, .9, .72)
+        line((.2, .51), (.5, .51))
+        dot(.76, .51, .05)
+    elif n == "stop":
+        rect(.26, .26, .74, .74, fill=color, outline="")
+    elif n == "close":
+        line((.24, .24), (.76, .76))
+        line((.76, .24), (.24, .76))
+    elif n == "check":
+        line((.18, .52), (.42, .76), (.84, .26))
+    elif n == "save":
+        line((.14, .14), (.72, .14), (.86, .28), (.86, .86), (.14, .86),
+             (.14, .14))
+        line((.32, .14), (.32, .36), (.64, .36), (.64, .14))
+        rect(.3, .58, .7, .86)
+    elif n == "folder":
+        line((.1, .26), (.38, .26), (.47, .36), (.9, .36), (.9, .82),
+             (.1, .82), (.1, .26))
+    elif n == "trash":
+        line((.16, .27), (.84, .27))
+        line((.38, .27), (.4, .14), (.6, .14), (.62, .27))
+        line((.25, .27), (.3, .86), (.7, .86), (.75, .27))
+    elif n == "file":
+        line((.24, .1), (.6, .1), (.78, .28), (.78, .9), (.24, .9), (.24, .1))
+        line((.6, .1), (.6, .28), (.78, .28))
+    elif n == "lock":
+        rect(.2, .44, .8, .86)
+        arc(.32, .14, .68, .62, 0, 180)
+        line((.32, .38), (.32, .46))
+        line((.68, .38), (.68, .46))
+    elif n == "bolt":
+        line((.56, .1), (.24, .56), (.5, .56), (.42, .9), (.76, .42),
+             (.5, .42), (.56, .1))
+    elif n == "image":
+        rect(.12, .18, .88, .82)
+        line((.12, .74), (.4, .46), (.6, .66), (.72, .55), (.88, .7))
+        dot(.66, .34, .06)
+    elif n == "video":
+        rect(.1, .26, .66, .74)
+        line((.66, .42), (.9, .3), (.9, .7), (.66, .58))
+    elif n == "music":
+        line((.38, .76), (.38, .2), (.82, .12), (.82, .66))
+        oval(.18, .66, .4, .86, fill=color, outline="")
+        oval(.62, .58, .84, .78, fill=color, outline="")
+    elif n == "user":
+        oval(.34, .12, .66, .44)
+        arc(.16, .52, .84, 1.2, 0, 180)
+    elif n == "windows":
+        for (a, b, cc, d) in ((.14, .14, .48, .48), (.52, .14, .86, .48),
+                              (.14, .52, .48, .86), (.52, .52, .86, .86)):
+            rect(a, b, cc, d)
+    elif n == "warn":
+        line((.5, .12), (.9, .84), (.1, .84), (.5, .12))
+        line((.5, .38), (.5, .6))
+        dot(.5, .72, .05)
+    elif n == "columns":
+        rect(.12, .18, .88, .82)
+        line((.37, .18), (.37, .82))
+        line((.63, .18), (.63, .82))
+    elif n == "code":
+        line((.36, .26), (.12, .5), (.36, .74))
+        line((.64, .26), (.88, .5), (.64, .74))
+        line((.56, .18), (.44, .82))
+    elif n == "expand":
+        line((.14, .38), (.14, .14), (.38, .14))
+        line((.62, .14), (.86, .14), (.86, .38))
+        line((.86, .62), (.86, .86), (.62, .86))
+        line((.38, .86), (.14, .86), (.14, .62))
+    elif n == "filter":
+        line((.12, .18), (.88, .18), (.58, .52), (.58, .84), (.42, .76),
+             (.42, .52), (.12, .18))
+    elif n == "eye":
+        arc(.08, .2, .92, 1.0, 20, 140)
+        arc(.08, 0.0, .92, .8, 200, 140)
+        oval(.38, .38, .62, .62)
+
+
+class IconCanvas(tk.Canvas):
+    """A Canvas that draws a vector icon and behaves enough like a Label
+    (configure(text=, fg=, bg=)) to be a drop-in replacement."""
+
+    def __init__(self, master, glyph, size=18, fg="#000000", bg="#FFFFFF",
+                 **kw):
+        pxsz = px(size)
+        super().__init__(master, width=pxsz, height=pxsz, bg=bg,
+                         highlightthickness=0, bd=0, **kw)
+        self._glyph = glyph
+        self._fg = fg
+        self._px = pxsz
+        self._render()
+
+    def _render(self):
+        self.delete("all")
+        name = icon_name(self._glyph)
+        bg = tk.Canvas.cget(self, "bg")
+        if name:
+            pad = self._px * 0.06
+            draw_icon(self, name, pad, pad, self._px - 2 * pad, self._fg, bg)
+        elif self._glyph:
+            self.create_text(self._px / 2, self._px / 2, text=self._glyph,
+                             fill=self._fg,
+                             font=("Segoe UI Symbol", -int(self._px * 0.75)))
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        redraw = False
+        if "text" in kw:
+            self._glyph = kw.pop("text")
+            redraw = True
+        if "fg" in kw:
+            self._fg = kw.pop("fg")
+            redraw = True
+        kw.pop("font", None)
+        if kw:
+            if "bg" in kw or "background" in kw:
+                redraw = True
+            super().configure(**kw)
+        if redraw:
+            self._render()
+
+    config = configure
+
+    def cget(self, key):
+        if key == "fg":
+            return self._fg
+        if key == "text":
+            return self._glyph
+        return super().cget(key)
+
+
+class Tooltip:
+    """Minimal hover tooltip for any widget."""
+
+    def __init__(self, widget, text):
+        self.widget, self.text, self.tw = widget, text, None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _e=None):
+        if self.tw or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + self.widget.winfo_width() + px(6)
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() // 2 - px(12)
+            self.tw = tk.Toplevel(self.widget)
+            self.tw.wm_overrideredirect(True)
+            tk.Label(self.tw, text=self.text, bg="#111827", fg="white",
+                     font=UI_FONT, padx=px(8), pady=px(4)).pack()
+            self.tw.geometry(f"+{x}+{y}")
+        except Exception:
+            self.tw = None
+
+    def _hide(self, _e=None):
+        if self.tw:
+            try:
+                self.tw.destroy()
+            except Exception:
+                pass
+            self.tw = None
+
+
+def _install_dpi_scaling(root):
+    """Scale hard-coded pixel sizes by the real display DPI.
+
+    Patches a handful of tkinter entry points globally so the whole app
+    (tree columns, dialog sizes, wrap lengths) follows Windows display
+    scaling without touching hundreds of call sites."""
+    global UI_SCALE
+    S = _ui_scale(root)
+    UI_SCALE = S
+    if S <= 1.01 or getattr(tk, "_capacitra_scaled", False):
+        return
+    tk._capacitra_scaled = True
+    import re as _re
+
+    _orig_col = ttk.Treeview.column
+
+    def column(self, column, option=None, **kw):
+        for k in ("width", "minwidth"):
+            if isinstance(kw.get(k), int):
+                kw[k] = int(kw[k] * S)
+        return _orig_col(self, column, option, **kw)
+    ttk.Treeview.column = column
+
+    _orig_geo = tk.Wm.wm_geometry
+
+    def wm_geometry(self, newGeometry=None):
+        if isinstance(newGeometry, str):
+            m = _re.match(r"^(\d+)x(\d+)(.*)$", newGeometry)
+            if m and not isinstance(self, tk.Tk):
+                W = int(int(m.group(1)) * S)
+                H = int(int(m.group(2)) * S)
+                try:
+                    W = min(W, self.winfo_screenwidth() - 40)
+                    H = min(H, self.winfo_screenheight() - 80)
+                except Exception:
+                    pass
+                newGeometry = f"{W}x{H}{m.group(3)}"
+        return _orig_geo(self, newGeometry)
+    tk.Wm.wm_geometry = tk.Wm.geometry = wm_geometry
+
+    _orig_min = tk.Wm.wm_minsize
+
+    def wm_minsize(self, width=None, height=None):
+        if isinstance(width, int) and isinstance(height, int):
+            try:
+                width = min(int(width * S), self.winfo_screenwidth() - 40)
+                height = min(int(height * S), self.winfo_screenheight() - 80)
+            except Exception:
+                width, height = int(width * S), int(height * S)
+        return _orig_min(self, width, height)
+    tk.Wm.wm_minsize = tk.Wm.minsize = wm_minsize
+
+    _orig_label_init = tk.Label.__init__
+
+    def label_init(self, master=None, cnf={}, **kw):
+        if isinstance(kw.get("wraplength"), int):
+            kw["wraplength"] = int(kw["wraplength"] * S)
+        _orig_label_init(self, master, cnf, **kw)
+    tk.Label.__init__ = label_init
+
+
 class RibbonButton(tk.Frame):
     def __init__(self, master, theme, icon, label, command,
                  primary=False, **kw):
@@ -1693,55 +2182,58 @@ class RibbonButton(tk.Frame):
 # ---------------------------------------------------------------------------
 
 class SidebarItem(tk.Frame):
-    def __init__(self, master, theme, icon, label, command, has_submenu=False):
+    """Sidebar navigation row: accent marker · line icon · label.
+
+    In collapsed mode only the icon is shown (centred) and the label
+    becomes a hover tooltip."""
+
+    def __init__(self, master, theme, icon, label, command,
+                 has_submenu=False, collapsed=False):
         self.theme = theme
         self.command = command
-        self.has_submenu = has_submenu
+        self.has_submenu = False   # v4.4: no fake submenu chevrons
+        self.collapsed = collapsed
         self.active = False
+        self.chev = None
         super().__init__(master, bg=theme["sb_bg"])
         self._build(icon, label)
 
     def _build(self, icon, label):
         t = self.theme
-        self.inner = tk.Frame(self, bg=t["sb_bg"])
-        self.inner.pack(fill="x", padx=10, pady=2)
-        self.icon_lbl = tk.Label(self.inner, text=icon, bg=t["sb_bg"],
-                                 fg=t["sb_fg"],
-                                 font=("Segoe UI Emoji", 13), cursor="hand2")
-        self.icon_lbl.pack(side="left", padx=(12, 12), pady=8)
+        self.marker = tk.Frame(self, bg=t["sb_bg"], width=px(3))
+        self.marker.pack(side="left", fill="y", pady=px(6))
+        self.inner = tk.Frame(self, bg=t["sb_bg"], cursor="hand2")
+        self.inner.pack(fill="x", padx=(px(6), px(10)), pady=px(1))
+        self.icon_lbl = IconCanvas(self.inner, icon, size=18,
+                                   fg=t["sb_fg"], bg=t["sb_bg"],
+                                   cursor="hand2")
         self.text_lbl = tk.Label(self.inner, text=label, bg=t["sb_bg"],
                                  fg=t["sb_fg"], font=("Segoe UI", 10),
-                                 cursor="hand2")
-        self.text_lbl.pack(side="left", pady=10)
-        if self.has_submenu:
-            self.chev = tk.Label(self.inner, text="›", bg=t["sb_bg"],
-                                 fg=t["sb_fg"], font=("Segoe UI", 11),
-                                 cursor="hand2")
-            self.chev.pack(side="right", padx=(0, 14))
+                                 cursor="hand2", anchor="w")
+        if self.collapsed:
+            self.icon_lbl.pack(pady=px(8))
+            Tooltip(self.inner, label)
+        else:
+            self.icon_lbl.pack(side="left", padx=(px(12), px(12)),
+                               pady=px(7))
+            self.text_lbl.pack(side="left", fill="x", expand=True)
         for w in (self, self.inner, self.icon_lbl, self.text_lbl):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
+            w.bind("<Enter>", self._on_enter, add="+")
+            w.bind("<Leave>", self._on_leave, add="+")
             w.bind("<Button-1>", self._on_click)
 
-    def _on_enter(self, _):
-        if self.active:
-            return
-        bg = self.theme["sb_bg_hover"]
+    def _paint(self, bg, fg):
         self.inner.configure(bg=bg)
-        for w in (self.icon_lbl, self.text_lbl):
-            w.configure(bg=bg)
-        if self.has_submenu:
-            self.chev.configure(bg=bg)
+        self.icon_lbl.configure(bg=bg, fg=fg)
+        self.text_lbl.configure(bg=bg, fg=fg)
+
+    def _on_enter(self, _):
+        if not self.active:
+            self._paint(self.theme["sb_bg_hover"], self.theme["sb_fg_active"])
 
     def _on_leave(self, _):
-        if self.active:
-            return
-        bg = self.theme["sb_bg"]
-        self.inner.configure(bg=bg)
-        for w in (self.icon_lbl, self.text_lbl):
-            w.configure(bg=bg)
-        if self.has_submenu:
-            self.chev.configure(bg=bg)
+        if not self.active:
+            self._paint(self.theme["sb_bg"], self.theme["sb_fg"])
 
     def _on_click(self, _):
         if self.command:
@@ -1750,36 +2242,32 @@ class SidebarItem(tk.Frame):
     def set_active(self, on):
         self.active = on
         t = self.theme
-        bg = t["sb_bg_active"] if on else t["sb_bg"]
-        fg = t["sb_fg_active"] if on else t["sb_fg"]
-        self.inner.configure(bg=bg)
-        self.icon_lbl.configure(bg=bg, fg=fg)
-        self.text_lbl.configure(bg=bg, fg=fg)
-        if self.has_submenu:
-            self.chev.configure(bg=bg, fg=fg)
-
+        if on:
+            self._paint(t["sb_bg_active"], t["sb_fg_active"])
+            self.marker.configure(bg=t["accent"])
+        else:
+            self._paint(t["sb_bg"], t["sb_fg"])
+            self.marker.configure(bg=t["sb_bg"])
 
 
 class IconButton(tk.Frame):
-    """Header pill button: icon + text. Variants: primary, ghost."""
+    """Header pill button: line icon + text. Variants: primary, ghost."""
     def __init__(self, master, theme, icon, label, command, variant="ghost"):
         self.theme = theme
         self.variant = variant
         self.command = command
         bg = theme["accent"] if variant == "primary" else theme["panel"]
-        fg = "white" if variant == "primary" else theme["fg"]
-        super().__init__(master, bg=bg)
+        fg = "#FFFFFF" if variant == "primary" else theme["fg"]
+        super().__init__(master, bg=bg, cursor="hand2")
         self._bg = bg
         self._fg = fg
-        pad_x_ic = (18, 8) if variant == "primary" else (14, 6)
-        pad_x_tx = (0, 18)  if variant == "primary" else (0, 14)
-        pad_y    = 10       if variant == "primary" else 8
-        icon_font = ("Segoe UI Emoji", 13) if variant == "primary" \
-                    else ("Segoe UI Emoji", 11)
-        text_font = ("Segoe UI Semibold", 10) if variant == "primary" \
-                    else UI_FONT
-        self.icon_lbl = tk.Label(self, text=icon, bg=bg, fg=fg,
-                                 font=icon_font, cursor="hand2")
+        prim = variant == "primary"
+        pad_x_ic = (px(16), px(8)) if prim else (px(12), px(6))
+        pad_x_tx = (0, px(16)) if prim else (0, px(12))
+        pad_y = px(9) if prim else px(7)
+        text_font = ("Segoe UI Semibold", 10) if prim else UI_FONT
+        self.icon_lbl = IconCanvas(self, icon, size=16 if prim else 15,
+                                   fg=fg, bg=bg, cursor="hand2")
         self.icon_lbl.pack(side="left", padx=pad_x_ic, pady=pad_y)
         self.text_lbl = tk.Label(self, text=label, bg=bg, fg=fg,
                                  font=text_font, cursor="hand2")
@@ -1806,23 +2294,39 @@ class IconButton(tk.Frame):
             self.command()
 
 
-class GhostIconButton(tk.Label):
+class GhostIconButton(tk.Frame):
     """Small icon-only ghost button (theme toggle, kebab)."""
-    def __init__(self, master, theme, icon, command):
+    def __init__(self, master, theme, icon, command, tooltip=None):
         self.theme = theme
         self.command = command
-        super().__init__(master, text=icon, bg=theme["panel"],
-                         fg=theme["fg"], font=("Segoe UI Emoji", 13),
-                         cursor="hand2", padx=10, pady=6)
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        self.bind("<Button-1>", lambda e: command() if command else None)
+        super().__init__(master, bg=theme["panel"], cursor="hand2")
+        self.icon = IconCanvas(self, icon, size=17, fg=theme["fg"],
+                               bg=theme["panel"], cursor="hand2")
+        self.icon.pack(padx=px(9), pady=px(8))
+        for w in (self, self.icon):
+            w.bind("<Enter>", self._on_enter)
+            w.bind("<Leave>", self._on_leave)
+            w.bind("<Button-1>", lambda e: command() if command else None)
+        if tooltip:
+            Tooltip(self, tooltip)
+
+    def configure(self, cnf=None, **kw):
+        if cnf:
+            kw.update(cnf)
+        if "text" in kw:
+            self.icon.configure(text=kw.pop("text"))
+        if kw:
+            super().configure(**kw)
+
+    config = configure
 
     def _on_enter(self, _):
-        self.configure(bg=self.theme["panel_hover"])
+        tk.Frame.configure(self, bg=self.theme["panel_hover"])
+        self.icon.configure(bg=self.theme["panel_hover"])
 
     def _on_leave(self, _):
-        self.configure(bg=self.theme["panel"])
+        tk.Frame.configure(self, bg=self.theme["panel"])
+        self.icon.configure(bg=self.theme["panel"])
 
 
 # ---------------------------------------------------------------------------
@@ -1833,7 +2337,7 @@ class CapacitraApp:
     NAV_ITEMS = [
         ("overview",   "🏠", "Overview",    False),
         ("treemap",    "🗺", "Treemap",     False),
-        ("charts",     "📊", "Charts",      True),
+        ("charts",     "📊", "Charts",      False),
         ("duplicates", "⎘",  "Duplicates",  False),
         ("large",      "📦", "Large Files", False),
         ("types",      "🏷", "File Types",  False),
@@ -1846,7 +2350,16 @@ class CapacitraApp:
     def __init__(self, root):
         self.root = root
         self._alive = True   # cleared by _on_close so _poll_queue stops
-        self.theme_name = "light"
+        # v4.4: user preferences survive restarts
+        self._settings = self._load_settings()
+        self.theme_name = ("dark" if self._settings.get("theme") == "dark"
+                           else "light")
+        self._sidebar_collapsed = bool(self._settings.get("sidebar_collapsed"))
+        self._treemap_show_free = bool(self._settings.get("treemap_show_free"))
+        self._hidden_cols = set(self._settings.get("hidden_columns",
+                                                   ["accessed"]))
+        self._pending_theme_toggle = False
+        self._drive_map = {}
         self.theme = THEMES[self.theme_name]
         root.title(f"{APP_NAME}  ·  v{APP_VERSION}")
         # Size the window to fit the screen — never larger than the
@@ -1900,7 +2413,8 @@ class CapacitraApp:
         self._active_panel = None
 
         # User-editable exclude list (folder names skipped at scan time)
-        self._excludes = ["$Recycle.Bin", "System Volume Information"]
+        self._excludes = list(self._settings.get(
+            "excludes", ["$Recycle.Bin", "System Volume Information"]))
         # Advanced-filter parsed state
         self._adv = {"name": None, "min": 0, "max": float("inf"),
                      "age_max_days": None, "ext": None}
@@ -2034,6 +2548,24 @@ class CapacitraApp:
         return False
 
     # ----- Empty folder finder ---------------------------------------
+    @staticmethod
+    def _folder_truly_empty(path, _depth=0):
+        """True only if *path* contains no files at any depth and every
+        sub-folder can be read. Anything unexpected -> False."""
+        if _depth > 64:
+            return False
+        try:
+            with os.scandir(long_path(path)) as it:
+                for e in it:
+                    if e.is_symlink() or not e.is_dir(follow_symlinks=False):
+                        return False
+                    if not CapacitraApp._folder_truly_empty(e.path,
+                                                            _depth + 1):
+                        return False
+        except OSError:
+            return False
+        return True
+
     def _find_empty_folders(self):
         if not self.scan_result:
             self._warn("Run a scan first",
@@ -2048,8 +2580,11 @@ class CapacitraApp:
             # (recursively descending into subdirs that themselves are
             # empty). We only surface the outermost empty folder so the
             # user can Recycle just it, not every leaf below.
+            if getattr(node, "incomplete", False):
+                return
             has_content = any(
                 (not c.is_dir) or (c.size or 0) > 0 or c.children
+                or getattr(c, "incomplete", False)
                 for c in node.children
             )
             if not has_content and node.parent is not None:
@@ -2128,14 +2663,23 @@ class CapacitraApp:
                     "Nothing is hard-deleted."):
                 return
             ok = 0
+            skipped = 0
             for p in paths:
+                # Re-check on disk right before deleting: the folder may
+                # have gained files since the scan.
+                if not self._folder_truly_empty(p):
+                    skipped += 1
+                    continue
                 try:
                     if send_to_recycle_bin(p):
                         ok += 1
                 except Exception:
                     pass
-            self._info("Done",
-                       f"Moved {ok}/{len(paths)} to Recycle Bin.")
+            msg = f"Moved {ok}/{len(paths)} to Recycle Bin."
+            if skipped:
+                msg += (f"\n{skipped} folder(s) were skipped because they "
+                        "are no longer empty or could not be fully read.")
+            self._info("Done", msg)
             try:
                 self._refresh_after_recycle(paths)
             except Exception:
@@ -2191,31 +2735,31 @@ class CapacitraApp:
 
         if not hits:
             self._info(
-                "No suspicious executables",
+                "No executables outside standard locations",
                 "Every .exe / .dll / .bat / .ps1 / .vbs found is inside "
                 "Program Files, Windows or ProgramData. That's the "
-                "normal state on a clean system.")
+                "expected state on a clean system.")
             return
 
         t = self.theme
         win = tk.Toplevel(self.root)
-        win.title(f"Suspicious executables — {len(hits)} found")
+        win.title(f"Executable inventory — {len(hits)} found")
         win.configure(bg=t["panel"])
         win.transient(self.root)
         win.minsize(720, 480)
         win.geometry("960x600")
 
         tk.Label(win,
-                 text=f"Executables outside standard locations — "
+                 text=f"Executables outside Program Files & Windows — "
                       f"{len(hits):,} found",
                  bg=t["panel"], fg=t["fg"],
                  font=("Segoe UI Semibold", 15)).pack(
                      anchor="w", padx=24, pady=(20, 4))
         tk.Label(win,
-                 text="Sorted by modification time, newest first. "
-                      "A file appearing here is not necessarily malicious, "
-                      "but every one deserves a second look on unfamiliar "
-                      "systems.",
+                 text="Every executable file in the scan tree that lives "
+                      "outside Program Files, Windows, and ProgramData. "
+                      "Sorted by modification time, newest first. Useful "
+                      "for taking inventory of what is installed where.",
                  bg=t["panel"], fg=t["muted"], font=UI_FONT,
                  justify="left", wraplength=880).pack(
                      anchor="w", padx=24, pady=(0, 12))
@@ -2642,10 +3186,12 @@ class CapacitraApp:
         s = self.style
         s.configure("Treeview", background=t["panel"],
                     fieldbackground=t["panel"], foreground=t["fg"],
-                    rowheight=30, font=UI_FONT, borderwidth=0)
+                    rowheight=px(28), font=UI_FONT, borderwidth=0)
         s.configure("Treeview.Heading", background=t["panel_alt"],
                     foreground=t["muted"], font=("Segoe UI", 9, "bold"),
-                    relief="flat", padding=(10, 6), borderwidth=0)
+                    relief="flat", padding=(px(10), px(6)), borderwidth=0)
+        s.configure("Treeview", bordercolor=t["border"],
+                    lightcolor=t["panel"], darkcolor=t["panel"])
         s.map("Treeview",
               background=[("selected", t["select"])],
               foreground=[("selected", t["fg"])])
@@ -2693,6 +3239,24 @@ class CapacitraApp:
               background=[("active", t["accent"]),
                           ("pressed", t["accent_dark"])])
         s.configure("Card.TFrame", background=t["panel"])
+        # Combobox (address bar) — follow the theme instead of system grey
+        s.configure("TCombobox", fieldbackground=t["panel_alt"],
+                    background=t["panel_alt"], foreground=t["fg"],
+                    arrowcolor=t["muted"], bordercolor=t["border"],
+                    lightcolor=t["panel_alt"], darkcolor=t["panel_alt"],
+                    padding=px(4))
+        s.map("TCombobox",
+              fieldbackground=[("readonly", t["panel_alt"])],
+              foreground=[("readonly", t["fg"])],
+              selectbackground=[("readonly", t["panel_alt"])],
+              selectforeground=[("readonly", t["fg"])])
+        try:
+            self.root.option_add("*TCombobox*Listbox.background", t["panel"])
+            self.root.option_add("*TCombobox*Listbox.foreground", t["fg"])
+            self.root.option_add("*TCombobox*Listbox.selectBackground",
+                                 t["accent"])
+        except tk.TclError:
+            pass
         if hasattr(self, "tree"):
             # Folder-tree row colours: the unicode bars in the "bar" column
             # inherit the row foreground, so we tint rows with the brand
@@ -2704,123 +3268,116 @@ class CapacitraApp:
             self.tree.tag_configure("synth", foreground=t["muted"])
 
     def _toggle_theme(self):
-        """Instant, crash-safe theme toggle.
+        """Switch light/dark.
 
-        Does NOT destroy or rebuild the widget tree. Instead, walks every
-        widget recursively and remaps its colour attributes from the old
-        theme to the new theme. Chart canvases are then asked to redraw.
+        v4.4: the UI is rebuilt from scratch (the only way every widget,
+        chart and ttk style picks up the new palette correctly) and the
+        scan data is restored afterwards. Rebuilding 350k tree nodes takes
+        ~0.2 s. The old crash happened when the theme was switched while a
+        scan was still writing to widgets that had just been destroyed, so
+        the switch is now deferred until running scans finish."""
+        busy = ((self.scan_thread and self.scan_thread.is_alive()) or
+                (self.dup_thread and self.dup_thread.is_alive()))
+        if busy:
+            self._pending_theme_toggle = True
+            self.status_var.set(
+                "The theme will switch as soon as the current scan finishes.")
+            return
+        self._apply_theme_switch()
 
-        This replaces the older destroy+rebuild approach that could take
-        many seconds and occasionally crash on large scan results
-        (>300k tree items).
-        """
+    def _apply_theme_switch(self):
+        self._pending_theme_toggle = False
+        self.theme_name = "dark" if self.theme_name == "light" else "light"
+        self.theme = THEMES[self.theme_name]
+        self._rebuild_ui()
+        self._save_settings()
+
+    def _rebuild_ui(self):
+        prev_panel = self._active_panel or "overview"
         try:
             self.root.configure(cursor="watch")
             self.root.update_idletasks()
         except Exception:
             pass
         try:
-            old_theme = dict(self.theme)
-            self.theme_name = "dark" if self.theme_name == "light" else "light"
-            self.theme = THEMES[self.theme_name]
-
-            # Build old-colour -> new-colour mapping so any widget currently
-            # painted in an old-theme colour will get its new-theme
-            # equivalent.
-            colour_map = {}
-            for k, old_c in old_theme.items():
-                new_c = self.theme.get(k)
-                if old_c and new_c and old_c != new_c:
-                    colour_map[old_c] = new_c
-
-            # ttk styles (Treeview, Scrollbar, Progressbar) get updated
-            # here — this covers dozens of widgets in a single call.
-            try:
-                self._apply_theme()
-            except Exception:
-                pass
-
-            # Walk every tk widget and remap colour attributes
-            try:
-                self._retint_widget(self.root, colour_map)
-            except Exception:
-                pass
-
-            # Also walk any open Toplevel dialogs
-            try:
-                for w in self.root.winfo_children():
-                    if isinstance(w, tk.Toplevel):
-                        self._retint_widget(w, colour_map)
-            except Exception:
-                pass
-
-            # Redraw known chart canvases so their painted items match
-            for attr in ("hero_canvas", "bar_chart", "pie",
-                         "sb_progress", "top_folders_canvas"):
-                w = getattr(self, attr, None)
-                if w is None:
-                    continue
-                try:
-                    if hasattr(w, "cget"):
-                        cur = w.cget("bg")
-                        if cur in colour_map:
-                            w.configure(bg=colour_map[cur])
-                    if hasattr(w, "redraw"):
-                        w.redraw()
-                except Exception:
-                    pass
-
-            # Refresh the treemap if it holds data
-            try:
-                if hasattr(self, "treemap") and hasattr(self.treemap, "redraw"):
-                    self.treemap.redraw()
-            except Exception:
-                pass
-
-            # Update the moon/sun button icon
-            try:
-                if hasattr(self, "theme_btn"):
-                    self.theme_btn.configure(
-                        text="🌙" if self.theme_name == "light" else "☀"
-                    )
-            except Exception:
-                pass
-
-            # Force a final layout pass
-            try:
-                self.root.configure(bg=self.theme["bg"])
-                self.root.update_idletasks()
-            except Exception:
-                pass
+            for child in self.root.winfo_children():
+                child.destroy()
+            self._cheat_win = None
+            self._nav_items.clear()
+            self._panels.clear()
+            self._active_panel = None
+            self._build_layout()
+            self._populate_drives()
+            self._apply_theme()
+            self._select_panel(prev_panel if prev_panel in self._panels
+                               else "overview")
+            if self.scan_result:
+                self._on_scan_done(self.scan_result, _restore=True)
+                if self._dup_result:
+                    try:
+                        self._on_dup_done({"groups": self._dup_result,
+                                           "skipped_cloud": 0})
+                    except Exception:
+                        pass
         finally:
             try:
                 self.root.configure(cursor="")
             except Exception:
                 pass
 
-    def _retint_widget(self, w, colour_map):
-        """Recursively walk widgets, remapping colour attributes.
+    def _run_pending_theme_toggle(self):
+        if getattr(self, "_pending_theme_toggle", False):
+            self._pending_theme_toggle = False
+            self.root.after(60, self._apply_theme_switch)
 
-        Handles bg, fg, highlightbackground, highlightcolor,
-        selectbackground, selectforeground, insertbackground,
-        activebackground, activeforeground, disabledforeground,
-        readonlybackground. Silently skips widgets that don't support
-        a given attribute.
-        """
-        attrs = ("bg", "fg", "highlightbackground", "highlightcolor",
-                 "selectbackground", "selectforeground",
-                 "insertbackground", "activebackground",
-                 "activeforeground", "disabledforeground",
-                 "readonlybackground", "troughcolor")
-        for attr in attrs:
-            try:
-                cur = w.cget(attr)
-                if cur in colour_map:
-                    w.configure(**{attr: colour_map[cur]})
-            except Exception:
-                pass
-        for c in w.winfo_children():
-            self._retint_widget(c, colour_map)
+    # ----- settings persistence (v4.4) -----
+    @staticmethod
+    def _settings_file():
+        if sys.platform == "win32":
+            base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        else:
+            base = os.path.join(os.path.expanduser("~"), ".config")
+        return os.path.join(base, "Capacitra", "settings.json")
+
+    def _load_settings(self):
+        try:
+            with open(self._settings_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings(self):
+        data = {
+            "theme": self.theme_name,
+            "sidebar_collapsed": bool(getattr(self, "_sidebar_collapsed", False)),
+            "treemap_show_free": bool(getattr(self, "_treemap_show_free", False)),
+            "hidden_columns": sorted(getattr(self, "_hidden_cols", set())),
+            "excludes": list(getattr(self, "_excludes", [])),
+        }
+        try:
+            p = self._settings_file()
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, p)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_volume_root(path):
+        """True when *path* is the root of a drive / mount point. Only then
+        does it make sense to add synthetic Free-space / Inaccessible
+        entries to the results."""
+        try:
+            p = os.path.abspath(path)
+            if sys.platform == "win32":
+                drive, rest = os.path.splitdrive(p)
+                return bool(drive) and rest in ("\\", "/", "")
+            return os.path.ismount(p)
+        except Exception:
+            return False
 
     # ----- top-level layout -----
     def _build_layout(self):
@@ -2829,7 +3386,9 @@ class CapacitraApp:
         outer = tk.Frame(self.root, bg=t["bg"])
         outer.pack(fill="both", expand=True)
         # Sidebar fixed width
-        self.sidebar = tk.Frame(outer, bg=t["sb_bg"], width=240)
+        self.sidebar = tk.Frame(
+            outer, bg=t["sb_bg"],
+            width=px(72) if self._sidebar_collapsed else px(232))
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         self._build_sidebar()
@@ -2845,70 +3404,80 @@ class CapacitraApp:
     # ----- Sidebar -----
     def _build_sidebar(self):
         t = self.theme
-        # Logo box
+        collapsed = getattr(self, "_sidebar_collapsed", False)
+        # Brand
         logo_row = tk.Frame(self.sidebar, bg=t["sb_bg"])
-        logo_row.pack(fill="x", padx=16, pady=(20, 16))
-        self._sb_logo_row = logo_row  # exposed for toggle
-        canvas = tk.Canvas(logo_row, width=44, height=44, bg=t["sb_bg"],
+        logo_row.pack(fill="x", padx=0 if collapsed else px(18),
+                      pady=(px(20), px(18)))
+        self._sb_logo_row = logo_row
+        mark = px(36)
+        canvas = tk.Canvas(logo_row, width=mark, height=mark, bg=t["sb_bg"],
                            highlightthickness=0)
-        canvas.pack(side="left")
-        self._draw_capacitra_mark(canvas, 22, 22, 20)
-        text_box = tk.Frame(logo_row, bg=t["sb_bg"])
-        text_box.pack(side="left", padx=10)
-        self._sb_logo_text_box = text_box  # exposed for toggle
-        tk.Label(text_box, text=APP_NAME, bg=t["sb_bg"], fg="white",
-                 font=("Segoe UI Semibold", 13)).pack(anchor="w")
-        tk.Label(text_box, text=APP_TAGLINE, bg=t["sb_bg"],
-                 fg=t["sb_label"], font=("Segoe UI", 8)).pack(anchor="w")
-
-        # Nav items
+        canvas.pack(side="top" if collapsed else "left")
+        self._draw_capacitra_mark(canvas, mark / 2, mark / 2, mark / 2 - 2)
+        if not collapsed:
+            text_box = tk.Frame(logo_row, bg=t["sb_bg"])
+            text_box.pack(side="left", padx=px(10))
+            self._sb_logo_text_box = text_box
+            tk.Label(text_box, text=APP_NAME, bg=t["sb_bg"], fg="white",
+                     font=("Segoe UI Semibold", 13)).pack(anchor="w")
+            tk.Label(text_box, text="Disk space analyzer", bg=t["sb_bg"],
+                     fg=t["sb_label"], font=("Segoe UI", 8)).pack(anchor="w")
+            tk.Label(self.sidebar, text="MENU", bg=t["sb_bg"],
+                     fg=t["sb_label"], font=("Segoe UI Semibold", 8)
+                     ).pack(anchor="w", padx=px(26), pady=(0, px(4)))
+        # Drive card is packed first (bottom) so it is never squeezed out
+        # on short screens; navigation takes the remaining height.
+        if collapsed:
+            self.sb_disk_card = None
+        else:
+            self.sb_disk_card = tk.Frame(self.sidebar, bg=t["sb_bg_active"])
+            self.sb_disk_card.pack(side="bottom", fill="x",
+                                   padx=px(14), pady=px(14))
         nav_box = tk.Frame(self.sidebar, bg=t["sb_bg"])
-        nav_box.pack(fill="x", pady=(10, 0))
+        nav_box.pack(fill="x")
         for key, icon, label, sub in self.NAV_ITEMS:
             it = SidebarItem(nav_box, t, icon, label,
                              command=lambda k=key: self._select_panel(k),
-                             has_submenu=sub)
+                             collapsed=collapsed)
             it.pack(fill="x")
             self._nav_items[key] = it
-        # Bottom mini disk card
-        spacer = tk.Frame(self.sidebar, bg=t["sb_bg"])
-        spacer.pack(fill="both", expand=True)
-        self.sb_disk_card = tk.Frame(self.sidebar, bg=t["sb_bg_active"],
-                                     highlightthickness=0)
-        self.sb_disk_card.pack(side="bottom", fill="x",
-                               padx=14, pady=14, ipady=2)
+        if collapsed:
+            return
         inner = tk.Frame(self.sb_disk_card, bg=t["sb_bg_active"])
-        inner.pack(fill="x", padx=10, pady=10)
-        tk.Label(inner, text="🖴", bg=t["sb_bg_active"], fg=t["sb_fg_active"],
-                 font=("Segoe UI Emoji", 12)).pack(side="left", padx=(0, 6))
+        inner.pack(fill="x", padx=px(12), pady=(px(10), px(4)))
+        IconCanvas(inner, "drive", size=18, fg=t["sb_fg_active"],
+                   bg=t["sb_bg_active"]).pack(side="left", padx=(0, px(8)),
+                                             anchor="n", pady=px(2))
         col = tk.Frame(inner, bg=t["sb_bg_active"])
         col.pack(side="left", fill="x", expand=True)
-        self.sb_disk_title = tk.Label(col, text="No drive scanned yet",
+        self.sb_disk_title = tk.Label(col, text="No scan yet",
                                       bg=t["sb_bg_active"],
                                       fg=t["sb_fg_active"],
-                                      font=("Segoe UI", 9, "bold"),
-                                      anchor="w", wraplength=170,
-                                      justify="left")
-        self.sb_disk_title.pack(anchor="w")
-        self.sb_disk_sub = tk.Label(col, text="—",
+                                      font=("Segoe UI Semibold", 9),
+                                      anchor="w", justify="left",
+                                      wraplength=150)
+        self.sb_disk_title.pack(anchor="w", fill="x")
+        self.sb_disk_sub = tk.Label(col, text="Pick a drive to begin",
                                     bg=t["sb_bg_active"],
                                     fg=t["sb_label"], font=("Segoe UI", 8),
-                                    anchor="w", wraplength=170,
-                                    justify="left")
-        self.sb_disk_sub.pack(anchor="w")
-        self.sb_progress = tk.Canvas(self.sb_disk_card,
-                                     height=6,
+                                    anchor="w", justify="left",
+                                    wraplength=150)
+        self.sb_disk_sub.pack(anchor="w", fill="x")
+        self.sb_progress = tk.Canvas(self.sb_disk_card, height=px(6),
                                      bg=t["sb_bg_active"],
                                      highlightthickness=0)
-        self.sb_progress.pack(fill="x", padx=12, pady=(2, 4))
+        self.sb_progress.pack(fill="x", padx=px(12), pady=(px(6), px(4)))
+        self.sb_progress.bind("<Configure>",
+                              lambda e: self._redraw_sb_progress())
         self.sb_progress_pct = tk.Label(self.sb_disk_card, text="",
                                         bg=t["sb_bg_active"],
                                         fg=t["sb_label"],
                                         font=("Segoe UI", 8))
-        self.sb_progress_pct.pack(anchor="w", padx=12, pady=(0, 8))
-
-        # Theme toggle switch at the very bottom
-        self._build_theme_switch()
+        self.sb_progress_pct.pack(anchor="w", padx=px(12), pady=(0, px(10)))
+        st = getattr(self, "_sb_disk_state", None)
+        if st:
+            self.root.after(20, lambda: self._update_sb_disk(*st))
 
     def _draw_capacitra_mark(self, canvas, cx, cy, r):
             """Hexagonal Capacitra brand mark with a folder + bars inside."""
@@ -2978,26 +3547,46 @@ class CapacitraApp:
             w.bind("<Button-1>", lambda e: self._toggle_theme())
 
     def _update_sb_disk(self, used, total, label):
-        if total <= 0:
-            self.sb_disk_title.configure(text="No drive scanned yet")
-            self.sb_disk_sub.configure(text="—")
-            self.sb_progress_pct.configure(text="")
-            self.sb_progress.delete("all")
+        self._sb_disk_state = (used, total, label)
+        if not getattr(self, "sb_disk_card", None):
             return
-        pct = used / total * 100 if total else 0
-        self.sb_disk_title.configure(text=label or "Local Disk")
-        self.sb_disk_sub.configure(
-            text=f"{human_size(used)} / {human_size(total)} used")
-        self.sb_progress.delete("all")
-        w = self.sb_progress.winfo_width() or 200
-        h = 6
-        self.sb_progress.create_rectangle(0, 0, w, h,
-                                          fill=self.theme["sb_bg"],
-                                          outline="")
-        self.sb_progress.create_rectangle(0, 0, max(w * pct / 100, 4), h,
-                                          fill=self.theme["accent"],
-                                          outline="")
-        self.sb_progress_pct.configure(text=f"{pct:.0f}% Used")
+        try:
+            if total <= 0:
+                self.sb_disk_title.configure(text="No scan yet")
+                self.sb_disk_sub.configure(text="Pick a drive to begin")
+                self.sb_progress_pct.configure(text="")
+                self.sb_progress.delete("all")
+                return
+            pct = used / total * 100 if total else 0
+            self.sb_disk_title.configure(text=label or "Local Disk")
+            self.sb_disk_sub.configure(
+                text=f"{human_size(used)} of {human_size(total)} used")
+            self.sb_progress_pct.configure(text=f"{pct:.0f}% full")
+            self._redraw_sb_progress()
+        except tk.TclError:
+            pass
+
+    def _redraw_sb_progress(self):
+        st = getattr(self, "_sb_disk_state", None)
+        c = getattr(self, "sb_progress", None)
+        if not st or c is None or not getattr(self, "sb_disk_card", None):
+            return
+        try:
+            used, total, _ = st
+            pct = used / total * 100 if total else 0
+            c.delete("all")
+            w = c.winfo_width()
+            if w <= 1:
+                return
+            h = px(6)
+            c.create_rectangle(0, 0, w, h, fill=self.theme["sb_bg"],
+                               outline="")
+            col = (self.theme["danger"] if pct >= 90 else
+                   self.theme["warn"] if pct >= 75 else self.theme["accent"])
+            c.create_rectangle(0, 0, max(w * pct / 100, 4), h, fill=col,
+                               outline="")
+        except tk.TclError:
+            pass
 
     # ----- Header -----
     def _build_header(self, parent):
@@ -3040,106 +3629,31 @@ class CapacitraApp:
         self.theme_btn = GhostIconButton(right, t,
                                          "🌙" if self.theme_name == "light"
                                          else "☀",
-                                         self._toggle_theme)
+                                         self._toggle_theme,
+                                         tooltip="Switch light / dark theme")
         self.theme_btn.pack(side="left", padx=4)
         self.kebab_btn = GhostIconButton(right, t, "⋮",
-                                         self._show_kebab_menu)
+                                         self._show_kebab_menu,
+                                         tooltip="More tools")
         self.kebab_btn.pack(side="left", padx=4)
 
     def _toggle_sidebar(self):
-        """Collapse sidebar to a slim icon-rail / expand back."""
-        if not hasattr(self, "_sidebar_collapsed"):
-            self._sidebar_collapsed = False
-        if self._sidebar_collapsed:
-            # Expand back
-            self.sidebar.configure(width=240)
-            for it in self._nav_items.values():
-                try:
-                    it.text_lbl.pack(side="left", pady=10)
-                except Exception:
-                    pass
-                # Restore chevron if this item has a submenu
-                if getattr(it, "chev", None) is not None:
-                    try:
-                        it.chev.pack(side="right", padx=(0, 14))
-                    except Exception:
-                        pass
-                # Icon back to left-aligned
-                try:
-                    it.icon_lbl.pack_forget()
-                    it.icon_lbl.pack(side="left", padx=(12, 12))
-                except Exception:
-                    pass
-            # Restore logo text
-            try:
-                self._sb_logo_text_box.pack(side="left", padx=10)
-            except Exception:
-                pass
-            # Restore theme switch row
-            try:
-                self._sb_theme_row.pack(side="bottom", fill="x",
-                                        padx=24, pady=(0, 18))
-            except Exception:
-                pass
-            # Restore disk card
-            try:
-                self.sb_disk_card.pack(side="bottom", fill="x",
-                                       padx=14, pady=14, ipady=2)
-            except Exception:
-                pass
-            # Restore logo row with original 16px padding
-            try:
-                self._sb_logo_row.pack_forget()
-                self._sb_logo_row.pack(fill="x", padx=16, pady=(20, 16))
-            except Exception:
-                pass
-            self._sidebar_collapsed = False
-        else:
-            # Collapse to 64px icon-rail
-            self.sidebar.configure(width=64)
-            for it in self._nav_items.values():
-                try:
-                    it.text_lbl.pack_forget()
-                except Exception:
-                    pass
-                if getattr(it, "chev", None) is not None:
-                    try:
-                        it.chev.pack_forget()
-                    except Exception:
-                        pass
-                # Center the icon in the collapsed 64px rail
-                try:
-                    it.icon_lbl.pack_forget()
-                    it.icon_lbl.pack(pady=10)
-                except Exception:
-                    pass
-            # Hide logo text — only the mark remains visible
-            try:
-                self._sb_logo_text_box.pack_forget()
-            except Exception:
-                pass
-            # Hide theme switch row (pill is too wide for 64px)
-            try:
-                self._sb_theme_row.pack_forget()
-            except Exception:
-                pass
-            # Hide disk card entirely
-            try:
-                self.sb_disk_card.pack_forget()
-            except Exception:
-                pass
-            # Recenter the 44px logo inside 64px rail (padx 10 vs 16)
-            try:
-                self._sb_logo_row.pack_forget()
-                self._sb_logo_row.pack(fill="x", padx=10, pady=(20, 16))
-            except Exception:
-                pass
-            self._sidebar_collapsed = True
-        # Force immediate layout redraw
-        try:
-            self.root.update_idletasks()
-        except Exception:
-            pass
+        """Collapse the sidebar to an icon rail / expand it back.
+
+        v4.4: the sidebar is rebuilt instead of pack_forget()/re-pack of
+        individual widgets, which used to shuffle their order (icons after
+        labels, logo at the bottom, broken disk bar)."""
+        self._sidebar_collapsed = not getattr(self, "_sidebar_collapsed",
+                                              False)
+        for w in self.sidebar.winfo_children():
+            w.destroy()
+        self._nav_items.clear()
+        self.sidebar.configure(
+            width=px(72) if self._sidebar_collapsed else px(232))
+        self._build_sidebar()
+        if self._active_panel in self._nav_items:
+            self._nav_items[self._active_panel].set_active(True)
+        self._save_settings()
 
     def _show_kebab_menu(self):
         m = tk.Menu(self.root, tearoff=0)
@@ -3171,7 +3685,7 @@ class CapacitraApp:
         m.add_separator()
         m.add_command(label="Find empty folders…",
                       command=self._find_empty_folders)
-        m.add_command(label="Suspicious executables…",
+        m.add_command(label="Executable inventory…",
                       command=self._show_suspicious_exes)
         m.add_command(label="Downloads folder aging…",
                       command=self._show_downloads_hint)
@@ -3197,9 +3711,9 @@ class CapacitraApp:
         pill = tk.Frame(bar, bg=t["panel"], highlightthickness=1,
                         highlightbackground=t["border"])
         pill.pack(side="left")
-        tk.Label(pill, text="🖴", bg=t["panel"], fg=t["accent"],
-                 font=("Segoe UI Emoji", 11)).pack(side="left",
-                                                   padx=(10, 6), pady=6)
+        IconCanvas(pill, "drive", size=16, fg=t["accent"],
+                   bg=t["panel"]).pack(side="left", padx=(px(10), px(6)),
+                                       pady=px(6))
         self.path_var = tk.StringVar()
         self.path_combo = ttk.Combobox(pill, textvariable=self.path_var,
                                        width=22, state="readonly")
@@ -3207,16 +3721,12 @@ class CapacitraApp:
         self.path_combo.bind("<<ComboboxSelected>>",
                              lambda e: self._on_drive_change())
         # Browse… button inside the same pill
-        browse_btn = tk.Label(pill, text="📂  Browse…", bg=t["panel"],
-                              fg=t["accent"], cursor="hand2",
-                              font=("Segoe UI", 9, "bold"),
-                              padx=10, pady=6)
-        browse_btn.pack(side="left", padx=(0, 4), pady=4)
-        browse_btn.bind("<Enter>",
-                        lambda e: browse_btn.configure(bg=t["panel_hover"]))
-        browse_btn.bind("<Leave>",
-                        lambda e: browse_btn.configure(bg=t["panel"]))
-        browse_btn.bind("<Button-1>", lambda e: self._browse_and_scan())
+        browse_btn = IconButton(pill, t, "📁", "Browse…",
+                                self._browse_and_scan, variant="ghost")
+        browse_btn.text_lbl.configure(fg=t["accent"],
+                                      font=("Segoe UI Semibold", 9))
+        browse_btn.icon_lbl.configure(fg=t["accent"])
+        browse_btn.pack(side="left", padx=(0, px(4)), pady=px(2))
         # Breadcrumb area
         self.crumb_box = tk.Frame(bar, bg=t["bg"])
         self.crumb_box.pack(side="left", padx=14, fill="x", expand=True)
@@ -3224,22 +3734,26 @@ class CapacitraApp:
         search_frame = tk.Frame(bar, bg=t["panel"], highlightthickness=1,
                                 highlightbackground=t["border"])
         search_frame.pack(side="right", padx=(0, 6))
-        tk.Label(search_frame, text="🔎", bg=t["panel"], fg=t["muted"],
-                 font=("Segoe UI Emoji", 10)).pack(side="left",
-                                                   padx=(10, 4), pady=6)
+        IconCanvas(search_frame, "filter", size=14, fg=t["muted"],
+                   bg=t["panel"]).pack(side="left", padx=(px(10), px(4)),
+                                       pady=px(6))
         self.filter_var = tk.StringVar()
         self.filter_entry = tk.Entry(search_frame, textvariable=self.filter_var,
                                      bd=0, bg=t["panel"], fg=t["fg"],
+                                     insertbackground=t["fg"],
+                                     highlightthickness=0,
                                      width=24, font=UI_FONT)
         self.filter_entry.pack(side="left", padx=(0, 8), pady=4)
         self.filter_entry.bind("<KeyRelease>", lambda e: self._apply_filter())
         # Filter icon button
-        fbtn = tk.Label(bar, text="⛃", bg=t["panel"], fg=t["fg"],
-                        font=("Segoe UI Emoji", 12), padx=10, pady=6,
-                        highlightthickness=1,
-                        highlightbackground=t["border"],
-                        cursor="hand2")
+        # v4.4: this button used to do nothing. It now opens Find.
+        fbtn = GhostIconButton(bar, t, "search", self._open_find_dialog,
+                               tooltip="Find files by name  (Ctrl+Shift+F)")
+        fbtn.configure(highlightthickness=1, highlightbackground=t["border"])
         fbtn.pack(side="right")
+        Tooltip(self.filter_entry,
+                "Filter the folder tree. Examples: >1GB  ext:mp4  "
+                "age>365  name:backup")
 
     def _refresh_breadcrumb(self):
         for w in self.crumb_box.winfo_children():
@@ -3395,13 +3909,17 @@ class CapacitraApp:
                                     fg=t["success"], font=("Segoe UI", 12))
         self.status_icon.pack(side="left", padx=(0, 8))
         self.status_var = tk.StringVar(
-            value=f"Ready  ·  {APP_NAME} {APP_VERSION}  ·  Pick a drive from the sidebar and click New Scan to begin.")
-        tk.Label(inner, textvariable=self.status_var, bg=t["panel"],
-                 fg=t["muted"], font=UI_FONT, anchor="w"
-                 ).pack(side="left", fill="x", expand=True)
+            value=f"Ready  ·  {APP_NAME} {APP_VERSION}  ·  Pick a drive in "
+                  f"the address bar and click New Scan.")
+        # Progress bar lives on the right and is only shown while a scan
+        # or duplicate search is running (it used to sit there idle and
+        # overlap long status messages).
         self.progress = ttk.Progressbar(inner, mode="indeterminate",
-                                        length=180, style="TProgressbar")
-        self.progress.pack(side="right")
+                                        length=px(160), style="TProgressbar")
+        self._status_lbl = tk.Label(inner, textvariable=self.status_var,
+                                    bg=t["panel"], fg=t["muted"],
+                                    font=UI_FONT, anchor="w", width=1)
+        self._status_lbl.pack(side="left", fill="x", expand=True)
 
     # ----- Panels -----
     def _card(self, parent, padx=22, pady=16):
@@ -3444,10 +3962,9 @@ class CapacitraApp:
         icons_box.pack(side="right")
 
         def _hdr_btn(parent, icon, tip, cmd):
-            b = tk.Label(parent, text=icon, bg=t["panel"], fg=t["muted"],
-                         font=("Segoe UI Emoji", 11), padx=8, pady=4,
-                         cursor="hand2")
-            b.pack(side="right", padx=2)
+            b = IconCanvas(parent, icon, size=16, fg=t["muted"],
+                           bg=t["panel"], cursor="hand2")
+            b.pack(side="right", padx=px(6), pady=px(2))
             b.bind("<Enter>", lambda e: b.configure(bg=t["panel_hover"],
                                                     fg=t["fg"]))
             b.bind("<Leave>", lambda e: b.configure(bg=t["panel"],
@@ -3521,9 +4038,17 @@ class CapacitraApp:
             self._owner_cache = OrderedDict()
         vsb = ttk.Scrollbar(tree_box, orient="vertical",
                             command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(tree_box, orient="horizontal",
+                            command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_box.grid_rowconfigure(0, weight=1)
+        tree_box.grid_columnconfigure(0, weight=1)
+        self._apply_hidden_columns()
+        self.tree.bind("<Button-3>", self._tree_heading_menu, add="+")
+        self._build_empty_state(tree_box)
         self.tree.bind("<<TreeviewOpen>>", self._on_tree_open)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self._make_context_menu(self.tree, kind="tree")
@@ -3690,6 +4215,103 @@ class CapacitraApp:
                             text=f"{human_size(size)}  ({pct:.1f}%)",
                             fill=t["fg"], font=UI_FONT_BOLD)
 
+    # ----- Folder-tree column chooser (v4.4) -----
+    _TREE_COLS = [("size", "Size"), ("allocated", "Allocated"),
+                  ("files", "Files"), ("folders", "Folders"),
+                  ("bar", "Usage bar"), ("percent", "%"),
+                  ("modified", "Modified"), ("accessed", "Accessed"),
+                  ("owner", "Owner")]
+
+    def _apply_hidden_columns(self):
+        try:
+            shown = [c for c, _ in self._TREE_COLS
+                     if c not in self._hidden_cols]
+            self.tree["displaycolumns"] = shown
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _tree_heading_menu(self, event):
+        try:
+            if self.tree.identify_region(event.x, event.y) != "heading":
+                return
+        except tk.TclError:
+            return
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Show columns", state="disabled")
+        for col, title in self._TREE_COLS:
+            var = tk.BooleanVar(value=col not in self._hidden_cols)
+            m.add_checkbutton(
+                label=title, variable=var,
+                command=lambda c=col: self._toggle_tree_column(c))
+        m._vars = True
+        try:
+            m.tk_popup(event.x_root, event.y_root)
+        finally:
+            m.grab_release()
+
+    def _toggle_tree_column(self, col):
+        if col in self._hidden_cols:
+            self._hidden_cols.discard(col)
+        else:
+            self._hidden_cols.add(col)
+        self._apply_hidden_columns()
+        self._save_settings()
+
+    # ----- Empty state (v4.4) -----
+    def _build_empty_state(self, parent):
+        t = self.theme
+        card = tk.Frame(parent, bg=t["panel"])
+        self._empty_state = card
+        box = tk.Frame(card, bg=t["panel"])
+        box.place(relx=0.5, rely=0.45, anchor="center")
+        ic_wrap = tk.Frame(box, bg=t["accent_soft"])
+        ic_wrap.pack(pady=(0, px(16)))
+        IconCanvas(ic_wrap, "drive", size=34, fg=t["accent"],
+                   bg=t["accent_soft"]).pack(padx=px(16), pady=px(16))
+        tk.Label(box, text="Scan a drive to see where your space went",
+                 bg=t["panel"], fg=t["fg"],
+                 font=("Segoe UI Semibold", 15)).pack()
+        tk.Label(box,
+                 text="Capacitra maps every folder and file on the drive. "
+                      "Nothing is uploaded and nothing is deleted without "
+                      "asking you first.",
+                 bg=t["panel"], fg=t["muted"], font=("Segoe UI", 10),
+                 wraplength=460, justify="center").pack(pady=(px(6), px(18)))
+        btns = tk.Frame(box, bg=t["panel"])
+        btns.pack()
+        drv = self._selected_drive_path() if hasattr(self, "path_var") else ""
+        self._empty_scan_btn = IconButton(
+            btns, t, "🔍", f"Scan {drv}" if drv else "Scan drive",
+            self._start_scan, variant="primary")
+        self._empty_scan_btn.pack(side="left", padx=px(4))
+        IconButton(btns, t, "📁", "Choose a folder…", self._browse_and_scan,
+                   variant="ghost").pack(side="left", padx=px(4))
+        tk.Label(box, text="Tip: press ? at any time to see keyboard "
+                           "shortcuts.",
+                 bg=t["panel"], fg=t["muted"],
+                 font=("Segoe UI", 8)).pack(pady=(px(18), 0))
+        self._update_empty_state()
+
+    def _update_empty_state(self):
+        card = getattr(self, "_empty_state", None)
+        if card is None:
+            return
+        try:
+            busy = self.scan_thread and self.scan_thread.is_alive()
+            if self.scan_result or busy:
+                card.place_forget()
+            else:
+                drv = self._selected_drive_path()
+                try:
+                    self._empty_scan_btn.text_lbl.configure(
+                        text=f"Scan {drv}" if drv else "Scan drive")
+                except Exception:
+                    pass
+                card.place(relx=0, rely=0, relwidth=1, relheight=1)
+                card.lift()
+        except tk.TclError:
+            pass
+
     def _build_panel_treemap(self, parent):
         t = self.theme
         panel = tk.Frame(parent, bg=t["bg"])
@@ -3701,7 +4323,7 @@ class CapacitraApp:
         tk.Label(head, text="Treemap", bg=t["panel"], fg=t["fg"],
                  font=("Segoe UI Semibold", 12)).pack(side="left")
         tk.Label(head,
-                 text="Click any tile to drill down  ·  Hover for details",
+                 text="Click a tile to drill down",
                  bg=t["panel"], fg=t["muted"],
                  font=UI_FONT).pack(side="left", padx=10)
         IconButton(head, t, "↑", "Up",
@@ -3713,9 +4335,29 @@ class CapacitraApp:
             head, t, "🎨", "Color: depth",
             self._toggle_treemap_color, variant="ghost")
         self._treemap_color_btn.pack(side="right", padx=2)
+        self._treemap_free_btn = IconButton(
+            head, t, "🖴",
+            "Free space: on" if self._treemap_show_free
+            else "Free space: off",
+            self._toggle_treemap_free, variant="ghost")
+        self._treemap_free_btn.pack(side="right", padx=2)
         self.treemap = TreemapChart(wrap, t, on_click=self._on_treemap_click)
         self.treemap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self._panels["treemap"] = panel
+
+    def _toggle_treemap_free(self):
+        """Free space usually dwarfs everything else in the treemap and
+        charts; it is hidden there by default (it stays in the tree)."""
+        self._treemap_show_free = not self._treemap_show_free
+        try:
+            self._treemap_free_btn.text_lbl.configure(
+                text="Free space: on" if self._treemap_show_free
+                else "Free space: off")
+        except Exception:
+            pass
+        self._save_settings()
+        if self.current_node is not None:
+            self._focus_node(self.current_node, from_tree=True)
 
     def _toggle_treemap_color(self):
         """Flip between depth-based and extension-based tile colours."""
@@ -3724,7 +4366,7 @@ class CapacitraApp:
         TreemapChart.set_color_mode(new_mode)
         # Update the button label so the user knows the current state
         try:
-            label_text = "Color: file type" if new_mode == "by_extension" else "Color: depth"
+            label_text = "Color: type" if new_mode == "by_extension" else "Color: depth"
             self._treemap_color_btn.text_lbl.configure(text=label_text)
         except Exception:
             pass
@@ -3737,11 +4379,15 @@ class CapacitraApp:
     def _build_panel_charts(self, parent):
         t = self.theme
         panel = tk.Frame(parent, bg=t["bg"])
-        # Two cards stacked: Bar (top), Pie (bottom)
+        # v4.4: bar and pie side by side (pie used to be squeezed to a
+        # sliver at the bottom on laptop screens)
+        panel.grid_columnconfigure(0, weight=3, uniform="ch")
+        panel.grid_columnconfigure(1, weight=2, uniform="ch")
+        panel.grid_rowconfigure(0, weight=1)
         bar_wrap = tk.Frame(panel, bg=t["panel"], highlightthickness=1,
                             highlightbackground=t["border"])
-        bar_wrap.pack(fill="both", expand=True, pady=(0, 14))
-        tk.Label(bar_wrap, text="Bar Chart — largest items",
+        bar_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, px(7)))
+        tk.Label(bar_wrap, text="Largest items",
                  bg=t["panel"], fg=t["fg"],
                  font=("Segoe UI Semibold", 12)
                  ).pack(anchor="w", padx=18, pady=(14, 4))
@@ -3750,8 +4396,8 @@ class CapacitraApp:
 
         pie_wrap = tk.Frame(panel, bg=t["panel"], highlightthickness=1,
                             highlightbackground=t["border"])
-        pie_wrap.pack(fill="both", expand=True)
-        tk.Label(pie_wrap, text="Pie Chart — distribution",
+        pie_wrap.grid(row=0, column=1, sticky="nsew", padx=(px(7), 0))
+        tk.Label(pie_wrap, text="Distribution",
                  bg=t["panel"], fg=t["fg"],
                  font=("Segoe UI Semibold", 12)
                  ).pack(anchor="w", padx=18, pady=(14, 4))
@@ -4085,6 +4731,7 @@ class CapacitraApp:
                               if l.strip()]
             self.status_var.set(
                 f"Excludes saved ({len(self._excludes)} item(s)).")
+            self._save_settings()
         save_btn = tk.Frame(ex_card, bg=t["panel_alt"])
         save_btn.pack(fill="x", padx=16, pady=(0, 8))
         IconButton(save_btn, t, "💾", "Save excludes",
@@ -4950,7 +5597,6 @@ class CapacitraApp:
             ("builtins", "int"),
             ("builtins", "float"),
             ("builtins", "bool"),
-            ("builtins", "bytes"),
             ("builtins", "NoneType"),
             ("collections", "defaultdict"),
             ("collections", "OrderedDict"),
@@ -4965,6 +5611,56 @@ class CapacitraApp:
                     f"Refusing to load unsafe pickle class: "
                     f"{module}.{name}")
         return _Restricted(fp)
+
+    _SNAPSHOT_MAX_BYTES = 1536 * 1024 * 1024
+
+    def _read_snapshot(self, path):
+        """Load and validate a .capsnap file. Raises ValueError when the
+        file is not a genuine, self-consistent Capacitra snapshot."""
+        if os.path.getsize(path) > self._SNAPSHOT_MAX_BYTES:
+            raise ValueError("Snapshot file is too large.")
+        with open(path, "rb") as f:
+            if f.read(len(self._SNAPSHOT_MAGIC)) != self._SNAPSHOT_MAGIC:
+                raise ValueError("This file is not a Capacitra snapshot.")
+            data = self._safe_unpickler(f).load()
+        if not isinstance(data, dict) or not isinstance(data.get("result"),
+                                                        dict):
+            raise ValueError("Snapshot is damaged.")
+        root_path = data.get("scan_root")
+        res = data["result"]
+        root = res.get("root")
+        if not isinstance(root_path, str) or not isinstance(root, Node):
+            raise ValueError("Snapshot is damaged.")
+        if root_path.startswith("\\\\") and not root_path.startswith(
+                "\\\\?\\"):
+            # A network root would make Windows connect to that server
+            # (and send credentials) just by opening the snapshot.
+            raise ValueError("Snapshots of network shares are not supported.")
+        base = os.path.normcase(os.path.normpath(root_path))
+        stack = [root]
+        seen = 0
+        while stack:
+            n = stack.pop()
+            seen += 1
+            if seen > 50_000_000:
+                raise ValueError("Snapshot is too large.")
+            if not isinstance(n, Node) or not isinstance(n.path, str) \
+                    or not isinstance(n.name, str):
+                raise ValueError("Snapshot contains invalid entries.")
+            if n.path not in ("(free)", "(gap)"):
+                np_ = os.path.normcase(os.path.normpath(n.path))
+                if not (np_ == base or np_.startswith(base.rstrip("\\/")
+                                                      + os.sep)):
+                    raise ValueError("Snapshot contains paths outside its "
+                                     "scan folder.")
+            if not isinstance(n.children, list):
+                raise ValueError("Snapshot contains invalid entries.")
+            stack.extend(n.children)
+        res.setdefault("disk", {"total": 0, "used": 0, "free": 0})
+        for k in ("total_files", "total_bytes"):
+            if not isinstance(res.get(k), int):
+                raise ValueError("Snapshot is damaged.")
+        return data
 
     def _save_snapshot(self):
         if not self.scan_result:
@@ -5004,15 +5700,13 @@ class CapacitraApp:
         if not path:
             return
         try:
-            with open(path, "rb") as f:
-                head = f.read(len(self._SNAPSHOT_MAGIC))
-                if head != self._SNAPSHOT_MAGIC:
-                    self._error(
-                        "Not a Capacitra snapshot",
-                        "This file does not look like a Capacitra snapshot. "
-                        "For your safety the file was not loaded.")
-                    return
-                data = self._safe_unpickler(f).load()
+            try:
+                data = self._read_snapshot(path)
+            except ValueError as ve:
+                self._error("Snapshot not loaded",
+                            f"{ve}\n\nFor your safety the file was not "
+                            "loaded.")
+                return
             self.scan_root = data["scan_root"]
             self._overview_payload = None
             # Reuse the normal post-scan flow with _restore=True so that
@@ -5039,15 +5733,13 @@ class CapacitraApp:
         if not path:
             return
         try:
-            with open(path, "rb") as f:
-                head = f.read(len(self._SNAPSHOT_MAGIC))
-                if head != self._SNAPSHOT_MAGIC:
-                    self._error(
-                        "Not a Capacitra snapshot",
-                        "This file does not look like a Capacitra snapshot. "
-                        "For your safety the file was not loaded.")
-                    return
-                data = self._safe_unpickler(f).load()
+            try:
+                data = self._read_snapshot(path)
+            except ValueError as ve:
+                self._error("Snapshot not loaded",
+                            f"{ve}\n\nFor your safety the file was not "
+                            "loaded.")
+                return
             old_root = data["result"]["root"]
         except Exception as e:
             self._error("Load failed", str(e))
@@ -5097,13 +5789,27 @@ class CapacitraApp:
                 "Run it from the download build, not from source.")
             return
 
-        out_dir = os.path.dirname(exe_path)
+        # Reports go to %LOCALAPPDATA%\Capacitra\Reports so the task keeps
+        # working even if the .exe sits in a read-only or temporary folder.
+        out_dir = os.path.join(os.environ.get("LOCALAPPDATA")
+                               or os.path.dirname(exe_path),
+                               "Capacitra", "Reports")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            out_dir = os.path.dirname(exe_path)
         out_file = os.path.join(out_dir, "capacitra_daily.csv")
-
-        cmd = (
-            f'"{exe_path}" --scan "{self.scan_root}" '
-            f'--export "{out_file}" --quiet'
-        )
+        # list2cmdline applies the MSVCRT quoting rules, so roots such as
+        # D:\ (trailing backslash) no longer swallow the closing quote.
+        cmd = subprocess.list2cmdline(
+            [exe_path, "--scan", self.scan_root, "--export", out_file,
+             "--quiet"])
+        if len(cmd) > 261:
+            self._warn("Path too long",
+                       "Windows Task Scheduler limits the command to 261 "
+                       "characters. Move Capacitra.exe to a shorter folder "
+                       "(for example C:\\Tools) and try again.")
+            return
 
         try:
             # /SC DAILY /ST 03:00 → run once a day at 3 AM
@@ -5226,6 +5932,13 @@ class CapacitraApp:
         if not path or path in ("(free)", "(gap)"):
             return
         if action == "open":
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _EXECUTABLE_EXTS and not self._ask(
+                    "Run this program?",
+                    f"Opening this file will RUN it:\n\n{path}\n\n"
+                    "Only continue if you trust it. Use "
+                    "'Show in Explorer' to just locate it."):
+                return
             open_path(path)
         elif action == "explorer":
             open_in_explorer(path)
@@ -5366,15 +6079,38 @@ class CapacitraApp:
                                 drives.append(f"{path} ({name})")
                 except (PermissionError, FileNotFoundError):
                     pass
+        # v4.4: remember label -> real path so folders whose names contain
+        # " (" (e.g. "Program Files (x86)") are never mis-parsed.
+        self._drive_map = {}
+        for d in drives:
+            p = d.rsplit(" (", 1)[0] if d.endswith(")") else d
+            self._drive_map[d] = p
+        if self.scan_root and self.scan_root not in self._drive_map.values():
+            drives.append(self.scan_root)
+            self._drive_map[self.scan_root] = self.scan_root
         self.path_combo["values"] = drives
-        if drives:
+        sel = None
+        if self.scan_root:
+            for lbl, p in self._drive_map.items():
+                if os.path.normcase(p) == os.path.normcase(self.scan_root):
+                    sel = lbl
+                    break
+        if sel:
+            self.path_var.set(sel)
+        elif drives:
             self.path_var.set(drives[0])
 
     def _selected_drive_path(self):
         v = self.path_var.get().strip()
-        # Strip trailing label
-        if " (" in v:
-            v = v.split(" (")[0]
+        dm = getattr(self, "_drive_map", {})
+        if v in dm:
+            return dm[v]
+        # Typed/legacy label such as "E:\ (USB)": strip the label only
+        # when the full text is not itself an existing folder.
+        if not os.path.isdir(v) and v.endswith(")") and " (" in v:
+            cand = v.rsplit(" (", 1)[0]
+            if os.path.isdir(cand):
+                return cand
         return v
 
     def _on_primary_action(self):
@@ -5394,6 +6130,19 @@ class CapacitraApp:
         else:
             self.new_scan_btn.icon_lbl.configure(text="🔍")
             self.new_scan_btn.text_lbl.configure(text="New Scan")
+        self._show_progress(scanning)
+
+    def _show_progress(self, on):
+        try:
+            if on:
+                if not self.progress.winfo_ismapped():
+                    self.progress.pack(side="right", padx=(px(12), 0),
+                                       before=self._status_lbl)
+            else:
+                self.progress.stop()
+                self.progress.pack_forget()
+        except (tk.TclError, AttributeError):
+            pass
 
     def _start_scan(self):
         path = self._selected_drive_path()
@@ -5417,6 +6166,7 @@ class CapacitraApp:
                                       excludes=self._excludes)
         self.scan_thread.start()
         self._set_primary_button(scanning=True)
+        self._update_empty_state()
 
     def _rescan(self):
         if self.scan_root:
@@ -5437,14 +6187,15 @@ class CapacitraApp:
         f = filedialog.askdirectory(title="Select folder to analyze")
         if not f:
             return
-        # Match it against drive list display strings; otherwise show raw path
-        display = f
-        for v in self.path_combo["values"]:
-            if v.startswith(f):
-                display = v
+        f = os.path.normpath(f)
+        display = None
+        for lbl, p in getattr(self, "_drive_map", {}).items():
+            if os.path.normcase(os.path.normpath(p)) == os.path.normcase(f):
+                display = lbl
                 break
-        else:
-            # Append the chosen folder to the dropdown so it's selectable later
+        if display is None:
+            display = f
+            self._drive_map[f] = f
             values = list(self.path_combo["values"]) + [f]
             self.path_combo["values"] = values
         self.path_var.set(display)
@@ -5523,6 +6274,9 @@ class CapacitraApp:
                     self.status_icon.configure(fg=self.theme["warn"])
                     self.status_var.set("Scan cancelled.")
                     self._set_primary_button(scanning=False)
+                    self.scan_thread = None
+                    self._update_empty_state()
+                    self._run_pending_theme_toggle()
                 elif kind == "error":
                     self.progress.stop()
                     self.status_icon.configure(fg=self.theme["danger"])
@@ -5577,7 +6331,7 @@ class CapacitraApp:
             # Drop any prior synthetic entries (in case of rescan on same dict)
             root.children = [c for c in root.children
                              if c.path not in ("(free)", "(gap)")]
-            if disk["total"]:
+            if disk["total"] and self._is_volume_root(self.scan_root):
                 if disk["free"] > 0:
                     free_node = Node("[Free space]", "(free)", is_dir=False,
                                      parent=root)
@@ -5593,6 +6347,8 @@ class CapacitraApp:
             root.children.sort(key=lambda n: n.size, reverse=True)
         self.scan_result = result
         self._overview_payload = None
+        self._update_empty_state()
+        self._run_pending_theme_toggle()
         try:
             self._downloads_hint = self._analyze_downloads_aging()
         except Exception:
@@ -6045,6 +6801,8 @@ class CapacitraApp:
         self.current_node = node
         self._refresh_breadcrumb()
         items = [c for c in node.children if c.size > 0]
+        if not getattr(self, "_treemap_show_free", False):
+            items = [c for c in items if c.path != "(free)"]
         if hasattr(self, "treemap"):
             self.treemap.set_data(items[:60])
         if hasattr(self, "bar_chart"):
@@ -6173,14 +6931,15 @@ class CapacitraApp:
                 card = tk.Frame(self.cat_row, bg=t["panel"],
                                 highlightthickness=1,
                                 highlightbackground=t["border"])
-                card.pack(side="left", fill="both", expand=True,
-                          padx=4 if name != "Images" else (0, 4))
+                card.grid(row=0, column=0, sticky="nsew",
+                          padx=px(4), pady=px(4))
                 inner = tk.Frame(card, bg=t["panel"])
                 inner.pack(fill="x", padx=12, pady=10)
-                badge = tk.Label(inner, text=icon, bg=color, fg="white",
-                                 font=("Segoe UI Emoji", 12),
-                                 padx=8, pady=2)
+                badge = tk.Frame(inner, bg=color)
                 badge.pack(anchor="w")
+                IconCanvas(badge, "code" if name == "Code" else icon,
+                           size=16, fg="white", bg=color).pack(
+                               padx=px(7), pady=px(6))
                 tk.Label(inner, text=name, bg=t["panel"], fg=t["muted"],
                          font=UI_FONT).pack(anchor="w", pady=(8, 0))
                 tk.Label(inner, text=human_size(sz),
@@ -6191,6 +6950,14 @@ class CapacitraApp:
                          text=f"{cnt:,} files  ·  {pct:.1f}%",
                          bg=t["panel"], fg=t["muted"],
                          font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
+            # bind per widget: the theme switch rebuilds cat_row, so a
+            # flag on the app would leave the new frame unbound
+            self._cat_cols = None
+            if getattr(self, "_cat_bound", None) is not self.cat_row:
+                self.cat_row.bind("<Configure>",
+                                  lambda e: self._reflow_cat_cards())
+                self._cat_bound = self.cat_row
+            self._reflow_cat_cards()
         # Fill table with category column
         self.ext_tree.delete(*self.ext_tree.get_children())
         # Configure tags for color dots per category
@@ -6203,6 +6970,27 @@ class CapacitraApp:
                                  values=(f"●  {ext}", cat, human_size(sz),
                                          f"{pct:.2f}%", f"{cnt:,}"),
                                  tags=(f"cat_{cat}",))
+
+    def _reflow_cat_cards(self):
+        """Lay the category cards out in 8, 4 or 2 columns depending on
+        the available width (they used to overflow off-screen)."""
+        try:
+            cards = self.cat_row.winfo_children()
+            if not cards:
+                return
+            w = self.cat_row.winfo_width()
+            cols = 8 if w >= px(1100) else 4 if w >= px(400) else 2
+            if getattr(self, "_cat_cols", None) == (cols, len(cards)):
+                return
+            self._cat_cols = (cols, len(cards))
+            for i in range(8):
+                self.cat_row.grid_columnconfigure(i, weight=0, uniform="")
+            for i in range(cols):
+                self.cat_row.grid_columnconfigure(i, weight=1, uniform="cat")
+            for i, c in enumerate(cards):
+                c.grid_configure(row=i // cols, column=i % cols)
+        except tk.TclError:
+            pass
 
     def _fill_top(self, files):
         self.top_tree.delete(*self.top_tree.get_children())
@@ -6290,6 +7078,10 @@ class CapacitraApp:
                 pass
 
     def _on_dup_done(self, payload):
+        self.root.after(80, self._run_pending_theme_toggle)
+        self._on_dup_done_impl(payload)
+
+    def _on_dup_done_impl(self, payload):
         # Accept both new dict payload {"groups", "skipped_cloud"} and
         # the legacy list-of-tuples form, for backward compatibility.
         if isinstance(payload, dict):
@@ -6343,7 +7135,7 @@ class CapacitraApp:
         if not p:
             return
         try:
-            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+            with open(p, "w", newline="", encoding="utf-8-sig", errors="backslashreplace") as f:
                 w = csv.writer(f)
                 w.writerow(["Path", "Type", "Size (bytes)", "Size",
                             "Last modified"])
@@ -7203,7 +7995,7 @@ class CapacitraApp:
             f"<a href='https://capacitra.com'>capacitra.com</a></footer>"
             "</body></html>"
         )
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write(out)
 
 
@@ -7414,7 +8206,7 @@ def _run_cli(argv):
 
     try:
         if ext == ".csv":
-            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            with open(out_path, "w", newline="", encoding="utf-8-sig", errors="backslashreplace") as f:
                 w = csv.writer(f)
                 w.writerow(["Path", "Type", "Size (bytes)", "Size",
                             "Last modified"])
@@ -7443,7 +8235,7 @@ def _run_cli(argv):
                 ],
                 "tree": _cli_walk_json(result["root"]),
             }
-            with open(out_path, "w", encoding="utf-8") as f:
+            with open(out_path, "w", encoding="utf-8", errors="backslashreplace") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
     except Exception as e:
         sys.stderr.write(f"Capacitra: export failed: {e}\n")
@@ -7495,6 +8287,7 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
+    _install_dpi_scaling(root)
     # Build the app immediately so the window appears in ~200 ms.
     # Defer the icon (pixel-by-pixel render, ~700 ms cost) to after
     # the first idle event so the user perceives a much faster boot.

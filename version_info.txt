@@ -4,8 +4,8 @@
 # routinely flagged as "unknown publisher / no version info" malware.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(4, 0, 0, 0),
-    prodvers=(4, 0, 0, 0),
+    filevers=(4, 4, 0, 0),
+    prodvers=(4, 4, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -21,12 +21,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName',      u'Capacitra'),
             StringStruct(u'FileDescription',  u'Capacitra - Storage capacity intelligence'),
-            StringStruct(u'FileVersion',      u'4.0.0.0'),
+            StringStruct(u'FileVersion',      u'4.4.0.0'),
             StringStruct(u'InternalName',     u'Capacitra'),
             StringStruct(u'LegalCopyright',   u'© 2026 Capacitra. All rights reserved.'),
             StringStruct(u'OriginalFilename', u'Capacitra.exe'),
             StringStruct(u'ProductName',      u'Capacitra'),
-            StringStruct(u'ProductVersion',   u'4.0.0.0'),
+            StringStruct(u'ProductVersion',   u'4.4.0.0'),
             StringStruct(u'Comments',         u'Free, on-premise disk space analyser for Windows. https://capacitra.com'),
           ]
         )

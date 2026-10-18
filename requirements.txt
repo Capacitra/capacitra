@@ -1,17 +1,17 @@
 # Capacitra runtime + build dependencies.
 #
 # tkinter is part of Python's stdlib, so nothing else is strictly required to
-# run Capacitra.pyw. The packages below unlock optional export formats and
-# the packaged-exe build.
+# run Capacitra.pyw. Versions are pinned exactly so every CI build uses the
+# same inputs (reproducible builds, see SIGNING-POLICY.md).
 
 # Optional exports
-reportlab>=4.0
-openpyxl>=3.1
+reportlab==4.5.1
+openpyxl==3.1.5
 
 # Recycle Bin fallback for non-Windows dev machines (Windows uses the
-# built-in ctypes/SHFileOperationW path — no dependency needed).
-send2trash>=1.8; platform_system != "Windows"
+# built-in SHFileOperationW path, no dependency needed).
+send2trash==1.8.3; platform_system != "Windows"
 
 # Build only
-pyinstaller>=6.3
-Pillow>=10.0
+pyinstaller==6.22.3
+Pillow==12.3.0

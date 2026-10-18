@@ -9,28 +9,33 @@ on:
     types: [published]
   workflow_dispatch: {}
 
+# Least privilege: the build job can only read the repo.
+# Only the release job below gets write access.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Build on ${{ matrix.python-version }}
+    name: Build (Python 3.11)
     runs-on: windows-latest
-
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11"]
+    outputs:
+      sha256: ${{ steps.sha.outputs.sha256 }}
+    env:
+      # secrets cannot be read in `if:`, so expose only a yes/no flag
+      HAS_CERT: ${{ secrets.CERT_PFX_BASE64 != '' }}
 
     steps:
+      # Third-party actions are pinned to full commit SHAs so a moved tag
+      # cannot inject code into the release build.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -46,44 +51,65 @@ jobs:
       - name: Build executable
         run: pyinstaller --clean Capacitra.spec
 
+      - name: Sign executable (release only)
+        # Runs only when a certificate secret exists. If signing is
+        # configured and fails, the release fails instead of silently
+        # shipping an unsigned binary.
+        if: github.event_name == 'release' && env.HAS_CERT == 'true'
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        run: |
+          $pfx = "$env:RUNNER_TEMP\cert.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+            & signtool sign /f $pfx /p $env:CERT_PASSWORD `
+              /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
+              dist\Capacitra.exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
+          } finally {
+            Remove-Item $pfx -ErrorAction SilentlyContinue
+          }
+
       - name: Compute SHA-256
         id: sha
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Path dist\Capacitra.exe -Algorithm SHA256).Hash.ToLower()
-          echo "sha256=$hash" >> $env:GITHUB_OUTPUT
-          echo "Capacitra.exe SHA-256: $hash"
-
-      - name: Sign executable (release only, requires secrets)
-        if: github.event_name == 'release'
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          if ($env:CERT_PFX_BASE64 -and $env:CERT_PASSWORD) {
-            $pfx = "$env:RUNNER_TEMP\cert.pfx"
-            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
-            & signtool sign /f $pfx /p $env:CERT_PASSWORD `
-              /fd sha256 /tr http://timestamp.digicert.com /td sha256 `
-              dist\Capacitra.exe
-            Remove-Item $pfx
-          } else {
-            Write-Host "No CERT_PFX_BASE64 secret set, skipping signing."
-          }
-        env:
-          CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
-          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "$hash  Capacitra.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          Write-Host "Capacitra.exe SHA-256: $hash"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Capacitra-${{ github.sha }}
-          path: dist/Capacitra.exe
+          path: |
+            dist/Capacitra.exe
+            dist/SHA256SUMS.txt
           retention-days: 30
 
-      - name: Attach to Release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+  release:
+    name: Attach to GitHub Release
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          files: dist/Capacitra.exe
-          body_path: CHANGELOG_v4.1.md
+          name: Capacitra-${{ github.sha }}
+          path: dist
+
+      - name: Attach files
+        # No body_path: the release notes you write in the GitHub UI stay
+        # untouched. Only the binary and its checksum are added.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/Capacitra.exe
+            dist/SHA256SUMS.txt
           fail_on_unmatched_files: true
